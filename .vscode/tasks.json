@@ -1,0 +1,54 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build LED Project",
+      "type": "shell",
+      "command": "gcc",
+      "args": [
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-O2",
+        "-std=c17",
+        "${workspaceFolder}/src/led.c",
+        "${workspaceFolder}/src/main.c",
+        "-I${workspaceFolder}/src",
+        "-o",
+        "${workspaceFolder}/bin/led_project",
+        "-lm"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"],
+      "detail": "Compile all C source files with GCC"
+    },
+    {
+      "label": "Build with Make",
+      "type": "shell",
+      "command": "make",
+      "args": [],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "detail": "Build using the Makefile"
+    },
+    {
+      "label": "Clean Build",
+      "type": "shell",
+      "command": "make",
+      "args": ["clean"],
+      "group": "build",
+      "detail": "Remove all build artifacts"
+    },
+    {
+      "label": "Run Output",
+      "type": "shell",
+      "command": "${workspaceFolder}/bin/led_project",
+      "group": "test",
+      "dependsOn": "Build LED Project",
+      "detail": "Build then run the program"
+    }
+  ]
+}

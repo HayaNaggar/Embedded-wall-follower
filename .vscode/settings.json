@@ -1,0 +1,21 @@
+{
+  "files.associations": {
+    "*.h": "c",
+    "*.c": "c"
+  },
+  "C_Cpp.default.cStandard": "c17",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/src"
+  ],
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.formatOnSave": true,
+  "C_Cpp.clang_format_style": "{ BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 80 }",
+  "code-runner.executorMap": {
+    "c": "cd $dir && gcc $fileName -o $fileNameWithoutExt && ./$fileNameWithoutExt"
+  },
+  "code-runner.runInTerminal": true,
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+  "C_Cpp.errorSquiggles": "disabled"
+}
