@@ -51,6 +51,10 @@ canvas#maze{display:block;width:100%;height:100%;}
 .pid-title{font-family:'Orbitron',monospace;font-size:0.6rem;letter-spacing:0.2em;color:var(--dim);margin-bottom:8px;}
 .pid-row{display:flex;justify-content:space-between;font-size:0.65rem;margin-bottom:4px;color:var(--dim);}
 .pid-val{color:var(--text);font-weight:bold;}
+.pid-tune{display:flex;align-items:center;gap:8px;font-size:0.62rem;color:var(--dim);margin:4px 0;}
+.pid-tune-name{width:18px;color:var(--text);}
+.pid-tune input{flex:1;accent-color:var(--follow);}
+.pid-tune-val{width:40px;text-align:right;color:var(--text);font-weight:bold;}
 .turn-log{padding:12px;border-bottom:1px solid var(--border);flex-shrink:0;}
 .turn-log-title{font-family:'Orbitron',monospace;font-size:0.6rem;letter-spacing:0.2em;color:var(--dim);margin-bottom:8px;}
 .turn-sequence{display:flex;flex-wrap:wrap;gap:4px;min-height:24px;}
@@ -101,6 +105,8 @@ footer{grid-column:1/-1;padding:6px 16px;background:rgba(10,21,32,0.95);border-t
       <div class="fsm-state active" id="fs-IDLE"        style="color:#4a9eff">IDLE</div>
       <div class="fsm-state"        id="fs-FOLLOW_WALL" style="color:#00e676">FOLLOW</div>
       <div class="fsm-state"        id="fs-SLOW_DOWN"   style="color:#ffca28">SLOW</div>
+      <div class="fsm-state"        id="fs-ADJUST_LEFT" style="color:#e040fb">ADJ L</div>
+      <div class="fsm-state"        id="fs-ADJUST_RIGHT" style="color:#ff6d00">ADJ R</div>
       <div class="fsm-state"        id="fs-TURNING"     style="color:#ff6d00">TURNING</div>
       <div class="fsm-state"        id="fs-COMPLETE"    style="color:#00e5ff">COMPLETE</div>
     </div>
@@ -137,6 +143,21 @@ footer{grid-column:1/-1;padding:6px 16px;background:rgba(10,21,32,0.95);border-t
 
   <div class="pid-block">
     <div class="pid-title">PID CONTROLLER</div>
+    <div class="pid-tune">
+      <span class="pid-tune-name">Kp</span>
+      <input type="range" id="kpSlider" min="0" max="3" step="0.01" value="1.00">
+      <span class="pid-tune-val" id="kpVal">1.00</span>
+    </div>
+    <div class="pid-tune">
+      <span class="pid-tune-name">Ki</span>
+      <input type="range" id="kiSlider" min="0" max="0.2" step="0.001" value="0.015">
+      <span class="pid-tune-val" id="kiVal">0.015</span>
+    </div>
+    <div class="pid-tune">
+      <span class="pid-tune-name">Kd</span>
+      <input type="range" id="kdSlider" min="0" max="1.2" step="0.01" value="0.25">
+      <span class="pid-tune-val" id="kdVal">0.25</span>
+    </div>
     <div class="pid-row"><span>Error (e)</span><span class="pid-val" id="pid-e">0.0 cm</span></div>
     <div class="pid-row"><span>P term</span>  <span class="pid-val" id="pid-p">0.00</span></div>
     <div class="pid-row"><span>I term</span>  <span class="pid-val" id="pid-i">0.00</span></div>
@@ -239,6 +260,7 @@ function getMazeTransform(){
 const FSM = {
   // Sensor thresholds (cm)
   DESIRED_DIST      : 14,
+  MAX_SIDE_US       : 80,
   FRONT_SLOW_THRESH : 40,
   IR_OPEN_THRESH    : 35,
   ALL_OPEN_THRESH   : 55,
@@ -247,12 +269,15 @@ const FSM = {
   KP: 1.0,
   KI: 0.015,
   KD: 0.25,
+  PID_STEER_GAIN: 2.4,
 
   // States
   STATE: {
     IDLE        : 'IDLE',
     FOLLOW_WALL : 'FOLLOW_WALL',
     SLOW_DOWN   : 'SLOW_DOWN',
+    ADJUST_LEFT : 'ADJUST_LEFT',
+    ADJUST_RIGHT: 'ADJUST_RIGHT',
     TURNING     : 'TURNING',
     COMPLETE    : 'COMPLETE',
   },
@@ -275,6 +300,8 @@ const FSM = {
   turning: false,
   turnDir: null,
   angleTurned: 0,
+  turnTargetAngle: null,
+  turnJustFinished: false,
 
   pidI: 0,
   pidPrev: 0,
@@ -287,6 +314,8 @@ const FSM = {
     this.turning = false;
     this.turnDir = null;
     this.angleTurned = 0;
+    this.turnTargetAngle = null;
+    this.turnJustFinished = false;
     this.pidI = 0;
     this.pidPrev = 0;
     this._pid = { error: 0, p: 0, i: 0, d: 0 };
@@ -296,49 +325,55 @@ const FSM = {
     const result = { stateChanged: false, newState: null, event: null };
     const s = this.sensors;
 
-    const allClear = s.frontUS >= this.ALL_OPEN_THRESH
-                  && s.leftUS  >= this.ALL_OPEN_THRESH
-                  && s.rightUS >= this.ALL_OPEN_THRESH
-                  && s.leftIR
-                  && s.rightIR;
+    const emergency = s.frontUS >= this.ALL_OPEN_THRESH
+                   && s.leftUS  >= this.ALL_OPEN_THRESH
+                   && s.rightUS >= this.ALL_OPEN_THRESH
+                   && s.leftIR
+                   && s.rightIR;
 
-    if (allClear && this.state !== this.STATE.IDLE && this.state !== this.STATE.COMPLETE) {
-      result.event = 'SAFETY STOP: 5-Sensor Clearance Detected';
+    if (emergency && this.state !== this.STATE.IDLE) {
+      result.event = 'EMERGENCY: Lost wall tracking, return to Idle';
       this._transition(this.STATE.IDLE, result);
       return result;
     }
 
-    if (this.state === this.STATE.IDLE) {
-      this.leftMotor = 0;
-      this.rightMotor = 0;
-      if (!s.leftIR && !s.rightIR) {
-        result.event = 'Input: 2 IR No Detect / Output: Start Motion';
-        this._transition(this.STATE.FOLLOW_WALL, result);
-      }
-      return result;
-    }
-
-    if (this.state === this.STATE.TURNING) {
-      this.leftMotor  = this.turnDir === 'L' ? -50 : 50;
-      this.rightMotor = this.turnDir === 'L' ?  50 : -50;
-
-      if (this.angleTurned >= 90) {
-        this.turning = false;
-        this.angleTurned = 0;
-        this.pidI = 0;
-        this.pidPrev = 0;
-        result.event = 'Input: 90deg Reached / Output: Resume MOVE';
-        this._transition(this.STATE.FOLLOW_WALL, result);
-      }
-      return result;
-    }
-
     switch (this.state) {
+      case this.STATE.IDLE:
+        this.leftMotor = 0;
+        this.rightMotor = 0;
+        if (!s.leftIR && !s.rightIR) {
+          result.event = 'Walls detected -> MOVE';
+          this._transition(this.STATE.FOLLOW_WALL, result);
+        }
+        break;
+
       case this.STATE.FOLLOW_WALL:
         if (s.frontUS < this.FRONT_SLOW_THRESH) {
           this._transition(this.STATE.SLOW_DOWN, result);
+        } else if (s.rightUS < 10) {
+          this._transition(this.STATE.ADJUST_LEFT, result);
+        } else if (s.leftUS < 10) {
+          this._transition(this.STATE.ADJUST_RIGHT, result);
         } else {
           this._runPID(dt, 62);
+        }
+        break;
+
+      case this.STATE.ADJUST_LEFT:
+        if (s.rightUS >= this.DESIRED_DIST) {
+          this._transition(this.STATE.FOLLOW_WALL, result);
+        } else {
+          this.leftMotor = 40;
+          this.rightMotor = 60;
+        }
+        break;
+
+      case this.STATE.ADJUST_RIGHT:
+        if (s.leftUS >= this.DESIRED_DIST) {
+          this._transition(this.STATE.FOLLOW_WALL, result);
+        } else {
+          this.leftMotor = 60;
+          this.rightMotor = 40;
         }
         break;
 
@@ -346,19 +381,36 @@ const FSM = {
         if (s.leftIR) {
           this.turnDir = 'L';
           this.turning = true;
+          this.turnTargetAngle = null;
           result.event = 'Input: Left IR Open / Output: Turn Left';
           result.turn = 'L';
           this._transition(this.STATE.TURNING, result);
         } else if (s.rightIR) {
           this.turnDir = 'R';
           this.turning = true;
+          this.turnTargetAngle = null;
           result.event = 'Input: Right IR Open / Output: Turn Right';
           result.turn = 'R';
           this._transition(this.STATE.TURNING, result);
-        } else if (s.frontUS >= this.FRONT_SLOW_THRESH) {
-          this._transition(this.STATE.FOLLOW_WALL, result);
         } else {
-          this._runPID(dt, 32);
+          this.leftMotor = 20;
+          this.rightMotor = 20;
+        }
+        break;
+
+      case this.STATE.TURNING:
+        this.leftMotor  = this.turnDir === 'L' ? -50 : 50;
+        this.rightMotor = this.turnDir === 'L' ?  50 : -50;
+        if (this.angleTurned >= 90) {
+          this.turning = false;
+          this.angleTurned = 0;
+          this.turnTargetAngle = null;
+          this.turnJustFinished = true;
+          this.pidI = 0;
+          this.pidPrev = 0;
+          this.leftMotor = 0;
+          this.rightMotor = 0;
+          this._transition(this.STATE.FOLLOW_WALL, result);
         }
         break;
 
@@ -381,10 +433,10 @@ const FSM = {
 
   _runPID(dt, baseSpd) {
     const s = this.sensors;
-    const useLeft = s.leftUS < s.rightUS && s.leftUS < 80;
-    const refDist = useLeft ? s.leftUS : s.rightUS;
-    const side = useLeft ? 1 : -1;
-    const error = this.DESIRED_DIST - refDist;
+    const left = Math.min(s.leftUS, this.MAX_SIDE_US);
+    const right = Math.min(s.rightUS, this.MAX_SIDE_US);
+    // Centering error: 0 when robot is centered between left/right walls.
+    const error = left - right;
 
     this.pidI += error * dt;
     this.pidI = Math.max(-15, Math.min(15, this.pidI));
@@ -392,9 +444,10 @@ const FSM = {
     this.pidPrev = error;
 
     const out = (this.KP * error) + (this.KI * this.pidI) + (this.KD * dErr);
+    const steer = out * this.PID_STEER_GAIN;
 
-    this.leftMotor  = Math.max(-80, Math.min(100, baseSpd + out * side));
-    this.rightMotor = Math.max(-80, Math.min(100, baseSpd - out * side));
+    this.leftMotor  = Math.max(-80, Math.min(100, baseSpd - steer));
+    this.rightMotor = Math.max(-80, Math.min(100, baseSpd + steer));
 
     this._pid = { error, p: this.KP * error, i: this.KI * this.pidI, d: this.KD * dErr };
   },
@@ -404,7 +457,7 @@ const FSM = {
   },
 
   getPID() {
-    return { error: this.sensors.frontUS, p: this.sensors.nl ? 1 : 0, i: this.sensors.nr ? 1 : 0, d: this.sensors.wd };
+    return this._pid || { error: 0, p: 0, i: 0, d: 0 };
   },
 };
 
@@ -435,6 +488,24 @@ function castRay(rx, ry, angleDeg, maxCells=8) {
   return maxCells*SCALE;
 }
 
+function isWallAtWorld(wx, wy) {
+  const cx = Math.floor(wx / CELL);
+  const cy = Math.floor(wy / CELL);
+  if (cx < 0 || cy < 0 || cx >= COLS || cy >= ROWS) return true;
+  return maze[cy][cx] === 1;
+}
+
+function hitsWallCircle(wx, wy, radius) {
+  if (isWallAtWorld(wx, wy)) return true;
+  for (let i = 0; i < 8; i++) {
+    const a = (i * Math.PI) / 4;
+    const px = wx + Math.cos(a) * radius;
+    const py = wy + Math.sin(a) * radius;
+    if (isWallAtWorld(px, py)) return true;
+  }
+  return false;
+}
+
 // ── Simulation: feed sensor values into FSM module ───────────────
 function updateSensors() {
   if (!robot) return;
@@ -463,42 +534,61 @@ function updateSensors() {
 function moveRobot(dt) {
   if (!robot || FSM.state === FSM.STATE.IDLE || FSM.state === FSM.STATE.COMPLETE) return;
   const spd = speedMult;
+  const robotRadius = CELL * 0.28;
 
   if (FSM.turning) {
+    if (FSM.turnTargetAngle === null) {
+      FSM.turnTargetAngle = FSM.turnDir === 'L'
+        ? (robot.angle + 90 + 360) % 360
+        : (robot.angle - 90 + 360) % 360;
+    }
     const step = Math.min(110 * spd * dt, 90 - FSM.angleTurned);
     FSM.angleTurned += step;
     robot.angle = FSM.turnDir === 'L'
       ? (robot.angle + step + 360) % 360
       : (robot.angle - step + 360) % 360;
+    if (FSM.angleTurned >= 90 - 1e-6) {
+      robot.angle = FSM.turnTargetAngle;
+      FSM.angleTurned = 90;
+    }
     robot.trailPoints.push({x:robot.x, y:robot.y, state:FSM.state});
     if (robot.trailPoints.length>1200) robot.trailPoints.shift();
+    return;
+  }
+
+  // Skip one frame after turn completion to avoid a post-turn heading kick.
+  if (FSM.turnJustFinished) {
+    FSM.turnJustFinished = false;
     return;
   }
 
   // STRAIGHT — use FSM motor outputs (percent scale)
   const avg    = (FSM.leftMotor + FSM.rightMotor) / 2;
   const fwdSpd = (avg / 100) * ROBOT_SPEED * spd;
-  robot.angle += ((FSM.rightMotor - FSM.leftMotor) / 200) * 8 * dt;
+  robot.angle += ((FSM.rightMotor - FSM.leftMotor) / 200) * 15 * dt;
 
   const rad = robot.angle * Math.PI / 180;
   const nx  = robot.x + Math.cos(rad)*fwdSpd*CELL*dt;
   const ny  = robot.y - Math.sin(rad)*fwdSpd*CELL*dt;
 
-  const wp  = PATH[robot.wpIdx];
-  if (!wp){ running = false; FSM._transition(FSM.STATE.COMPLETE, {}); return; }
-  const wpX = wp.x*CELL+CELL/2, wpY = wp.y*CELL+CELL/2;
-
-  if (Math.hypot(wpX-robot.x, wpY-robot.y) < CELL*0.45) {
-    robot.x = wpX; robot.y = wpY;
-    if (robot.wpIdx+1 < PATH.length) robot.wpIdx++;
-    else { running = false; FSM._transition(FSM.STATE.COMPLETE, {}); return; }
+  if (hitsWallCircle(nx, ny, robotRadius)) {
+    robot.speed = 0;
+    penalties += dt;
   } else {
-    let ad = Math.atan2(-(wpY-robot.y), wpX-robot.x)*180/Math.PI - robot.angle;
-    if (ad> 180) ad-=360; if (ad<-180) ad+=360;
-    robot.angle += ad*0.12;
     robot.x = nx; robot.y = ny;
     totalDist  += fwdSpd * SCALE * dt;
     robot.speed = fwdSpd * SCALE;
+
+    // Passive goal check only; no path guidance/snap is applied.
+    const fin = PATH[PATH.length - 1];
+    const fx = fin.x * CELL + CELL / 2;
+    const fy = fin.y * CELL + CELL / 2;
+    if (Math.hypot(robot.x - fx, robot.y - fy) < CELL * 0.35) {
+      FSM._transition(FSM.STATE.COMPLETE, {});
+      running = false;
+      logEv('Reached FINISH zone (physics-only).', 'done');
+      document.getElementById('startBtn').textContent='▶ START';
+    }
   }
   robot.trailPoints.push({x:robot.x, y:robot.y, state:FSM.state});
   if (robot.trailPoints.length>1200) robot.trailPoints.shift();
@@ -526,7 +616,6 @@ function initRobot() {
     y: s0.y*CELL+CELL/2,
     angle: s0.angle,
     speed: 0,
-    wpIdx: 1,
     trailPoints: [],
     sensors: {},
   };
@@ -543,7 +632,7 @@ function initRobot() {
 // ═══════════════════════════════════════════════════════════════════
 const STATE_COLORS = {
   IDLE:'#4a9eff', FOLLOW_WALL:'#00e676', SLOW_DOWN:'#ffca28',
-  TURNING:'#ff6d00', COMPLETE:'#00e5ff'
+  ADJUST_LEFT:'#e040fb', ADJUST_RIGHT:'#ff6d00', TURNING:'#ff6d00', COMPLETE:'#00e5ff'
 };
 
 function drawAll() {
@@ -774,7 +863,31 @@ document.getElementById('speedSlider').oninput = function(){
   document.getElementById('speedVal').textContent = speedMult.toFixed(1)+'x';
 };
 
+function bindPIDTuning() {
+  const kpSlider = document.getElementById('kpSlider');
+  const kiSlider = document.getElementById('kiSlider');
+  const kdSlider = document.getElementById('kdSlider');
+  const kpVal = document.getElementById('kpVal');
+  const kiVal = document.getElementById('kiVal');
+  const kdVal = document.getElementById('kdVal');
+
+  function apply() {
+    FSM.KP = parseFloat(kpSlider.value);
+    FSM.KI = parseFloat(kiSlider.value);
+    FSM.KD = parseFloat(kdSlider.value);
+    kpVal.textContent = FSM.KP.toFixed(2);
+    kiVal.textContent = FSM.KI.toFixed(3);
+    kdVal.textContent = FSM.KD.toFixed(2);
+  }
+
+  kpSlider.oninput = apply;
+  kiSlider.oninput = apply;
+  kdSlider.oninput = apply;
+  apply();
+}
+
 // ── BOOT ─────────────────────────────────────────────────────────
+bindPIDTuning();
 initRobot(); drawAll();
 logEv('FSM module loaded. Press ▶ START.','ev');
 </script>
