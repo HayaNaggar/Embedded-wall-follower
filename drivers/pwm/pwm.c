@@ -1,16 +1,17 @@
 #include "pwm.h"
 #include <avr/io.h>
+#include <stdint.h>
 
 /**
- * @brief Initialize Fast PWM mode using Timer0
+ * @brief Initialize Fast PWM mode using Timer2
  */
 void PWM_Init(void)
 {
-    /* Set PD5 (OC0B) and PD6 (OC0A) as output */
-    DDRD |= (1 << PB3) | (1 << PD3);
+    /* OC2A = PD6, OC2B = PD3 */
+    DDRD |= (1 << PD3) | (1 << PD6);
 
     /*
-     * Fast PWM Mode
+     * Fast PWM mode
      * Non-inverting mode
      * Prescaler = 64
      */
@@ -21,8 +22,7 @@ void PWM_Init(void)
         (1 << WGM20);
 
     TCCR2B =
-        (1 << CS22) |
-        // (1 << CS20);
+        (1 << CS22);   // prescaler 64
 
     /* Start with motors stopped */
     OCR2A = 0;
@@ -34,7 +34,7 @@ void PWM_Init(void)
  */
 void PWM_SetLeftSpeed(uint8_t duty)
 {
-    OCR2B = duty;   /* PD5 */
+    OCR2B = duty;
 }
 
 /**
@@ -42,5 +42,5 @@ void PWM_SetLeftSpeed(uint8_t duty)
  */
 void PWM_SetRightSpeed(uint8_t duty)
 {
-    OCR2A = duty;   /* PD6 */
+    OCR2A = duty;
 }
