@@ -2,53 +2,54 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Build LED Project",
+      "label": "Build Robot",
       "type": "shell",
-      "command": "gcc",
+      "command": "avr-gcc",
       "args": [
-        "-g",
+        "-mmcu=atmega328p",
+        "-DF_CPU=16000000UL",
+        "-Os",
+        "-std=c11",
         "-Wall",
-        "-Wextra",
-        "-O2",
-        "-std=c17",
-        "${workspaceFolder}/src/led.c",
-        "${workspaceFolder}/src/main.c",
-        "-I${workspaceFolder}/src",
-        "-o",
-        "${workspaceFolder}/bin/led_project",
-        "-lm"
+        "-Iapp",
+        "-Idrivers/gpio",
+        "-Idrivers/sensors/IR",
+        "-Idrivers/uart",
+        "-Idrivers/timer",
+        "-Idrivers/pwm",
+        "-Imodules/motor",
+        "app/main.c",
+        "drivers/gpio/gpio.c",
+        "drivers/sensors/IR/IR_sensor.c",
+        "drivers/uart/uart.c",
+        "drivers/timer/timer.c",
+        "drivers/pwm/pwm.c",
+        "modules/motor/motor.c",
+        "-o", "build/robot.elf"
       ],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": ["$gcc"],
-      "detail": "Compile all C source files with GCC"
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
     },
     {
-      "label": "Build with Make",
+      "label": "Convert to HEX",
       "type": "shell",
-      "command": "make",
-      "args": [],
-      "group": "build",
-      "problemMatcher": ["$gcc"],
-      "detail": "Build using the Makefile"
+      "command": "avr-objcopy",
+      "args": ["-O", "ihex", "-R", ".eeprom", "build/robot.elf", "build/robot.hex"],
+      "dependsOn": "Build Robot"
     },
     {
-      "label": "Clean Build",
+      "label": "Flash to Nano",
       "type": "shell",
-      "command": "make",
-      "args": ["clean"],
-      "group": "build",
-      "detail": "Remove all build artifacts"
-    },
-    {
-      "label": "Run Output",
-      "type": "shell",
-      "command": "${workspaceFolder}/bin/led_project",
-      "group": "test",
-      "dependsOn": "Build LED Project",
-      "detail": "Build then run the program"
+      "command": "avrdude",
+      "args": [
+        "-p", "atmega328p",
+        "-c", "arduino",
+        "-P", "COM3",
+        "-b", "115200",
+        "-U", "flash:w:build/robot.hex:i"
+      ],
+      "dependsOn": "Convert to HEX",
+      "problemMatcher": []
     }
   ]
 }
