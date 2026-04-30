@@ -1,0 +1,23 @@
+A0->ultrasonic front
+A1->ultrasonic front
+
+A2->ultrasonic Left
+A3->ultrasonic Left
+
+A4->ultrasonic Right
+A5->ultrasonic Right
+
+Tx-> BT
+Rx-> BT
+
+D2->encoder B left DC
+D3->left IR
+D4->right IR
+D5->PWM 1
+D6->PWM 2
+D7->encoder A left motor
+D8-D11 -> bridge in and out
+D12->encoder B right motor
+D13->encoder A right
+
+empty-> A6 A7 
