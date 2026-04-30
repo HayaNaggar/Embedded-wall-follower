@@ -6,9 +6,9 @@
 /**
  * @brief Initialize PWM for motor speed control
  *
- * Uses Timer0 on Arduino Uno (ATmega328P)
- * OC0A -> PD6 (Pin D6)
- * OC0B -> PD5 (Pin D5)
+ * Uses Timer0 Fast PWM on ATmega328P
+ * OC0A -> PD6 (D6) -> right motor PWM
+ * OC0B -> PD5 (D5) -> left motor PWM
  */
 void PWM_Init(void);
 

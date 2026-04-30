@@ -2,7 +2,7 @@
  * @file    timer.c
  * @brief   Timer driver implementation for ATmega328P
  *
- * Timer0  -> CTC mode, prescaler 64, OCR0A = 249
+ * Timer2  -> CTC mode, prescaler 64, OCR2A = 249
  *            Fires ISR every 1ms at F_CPU = 16MHz
  *            Formula: (F_CPU / prescaler / target_freq) - 1
  *                     (16,000,000 / 64 / 1000) - 1 = 249
@@ -26,7 +26,7 @@
 #define F_CPU 16000000UL
 #endif
 
-/** @brief Timer0 CTC top value for 1ms tick (prescaler=64, F_CPU=16MHz) */
+/** @brief Timer2 CTC top value for 1ms tick (prescaler=64, F_CPU=16MHz) */
 #define TIMER0_CTC_TOP      249U
 
 /** @brief Timer1 prescaler = 8 -> 1 tick = 0.5us at 16MHz */
@@ -47,7 +47,7 @@ static volatile uint32_t g_ms_ticks = 0;
  * @brief  Timer0 Compare Match A ISR.
  *         Increments the global millisecond counter.
  */
-ISR(TIMER0_COMPA_vect)
+ISR(TIMER2_COMPA_vect)
 {
     g_ms_ticks++;
 }
@@ -57,34 +57,23 @@ ISR(TIMER0_COMPA_vect)
  * ----------------------------------------------------------------------- */
 
 /**
- * @brief  Initialize Timer0 (1ms tick) and Timer1 (us delay).
+ * @brief  Initialize Timer2 (1ms tick) and Timer1 (us delay).
+ *
+ * Timer0 is owned by the PWM driver (OC0A/OC0B on D6/D5).
+ * The millis counter is therefore on Timer2 CTC instead.
+ * Formula: (16,000,000 / 64 / 1000) - 1 = 249  (same prescaler, same result)
  */
 void timer_init(void)
 {
-    /* --- Timer0: CTC mode, 1ms tick --- */
-
-    /** @brief Set CTC mode: WGM01 = 1, WGM00 = 0 */
-    TCCR0A = (1 << WGM01);
-
-    /** @brief Set TOP value for 1ms period */
-    OCR0A  = TIMER0_CTC_TOP;
-
-    /** @brief Enable Timer0 Compare Match A interrupt */
-    TIMSK0 = (1 << OCIE0A);
-
-    /** @brief Start Timer0 with prescaler = 64 (CS01 | CS00) */
-    TCCR0B = (1 << CS01) | (1 << CS00);
-
+    /* --- Timer2: CTC mode, 1ms tick --- */
+    TCCR2A = (1 << WGM21);          /* CTC mode */
+    OCR2A  = TIMER0_CTC_TOP;        /* TOP = 249 → 1ms period */
+    TIMSK2 = (1 << OCIE2A);         /* enable compare-match A interrupt */
+    TCCR2B = (1 << CS22);           /* prescaler 64 */
 
     /* --- Timer1: Normal mode, prescaler 8, used for us delays --- */
-
-    /** @brief Normal mode (all WGM bits = 0, default after reset) */
     TCCR1A = 0x00;
-
-    /** @brief Prescaler = 8 (CS11 = 1) — gives 0.5us per tick at 16MHz */
-    TCCR1B = (1 << CS11);
-
-    /** @brief Disable all Timer1 interrupts; we use busy-wait only */
+    TCCR1B = (1 << CS11);           /* 0.5us per tick at 16MHz */
     TIMSK1 = 0x00;
 }
 

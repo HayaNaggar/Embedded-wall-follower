@@ -10,23 +10,17 @@ OBJCOPY = avr-objcopy
 AVRDUDE = avrdude
 
 PROGRAMMER = arduino
-PORT = /dev/ttyUSB0
+PORT = COM3
 BAUD = 57600
 
 CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -Os -std=c11 -Wall
 
 INCLUDES = -Iapp \
-           -Idrivers/gpio \
-           -Idrivers/sensors/IR \
-           -Idrivers/uart \
            -Idrivers/timer \
            -Idrivers/pwm \
            -Imodules/motor
 
 SRC = app/main.c \
-      drivers/gpio/gpio.c \
-      drivers/sensors/IR/IR_sensor.c \
-      drivers/uart/uart.c \
       drivers/timer/timer.c \
       drivers/pwm/pwm.c \
       modules/motor/motor.c
