@@ -1,434 +1,338 @@
 /**
  * @file    main.c
- * @brief   Wall-Following Autonomous Robot – Application Entry Point
+ * @brief   Wall-following robot – ATmega328P / Arduino Nano
+ *          Wall-centre PID  +  Encoder straight-line PID
  *
- * Hardware (ATmega328P / Arduino Nano):
- *  ┌─────────────────────────────────────────────────────┐
- *  │  Sensor            Pin           Role               │
- *  │  IR Left      →  PD3  (D3)   Front-left corner     │
- *  │  IR Right     →  PD4  (D4)   Front-right corner    │
- *  │  US Front     →  PC0/PC1     Forward obstacle       │
- *  │  US Left      →  PC2/PC3     Left wall distance     │
- *  │  US Right     →  PC4/PC5     Right wall distance    │
- *  │  Motor IN1-4  →  PB0-PB3                            │
- *  │  PWM L / R    →  PD6/PD5    (Timer0 OC0A/OC0B)     │
- *  │  UART TX/RX   →  PD1/PD0                            │
- *  └─────────────────────────────────────────────────────┘
+ * PIN ASSIGNMENTS
+ *   US Left  TRIG → PC2 (A2)    US Left  ECHO → PC3 (A3)
+ *   US Right TRIG → PC4 (A4)    US Right ECHO → PC5 (A5)
+ *   Motor L IN1   → PB0 (D8)    Motor L IN2   → PB1 (D9)
+ *   Motor R IN3   → PB2 (D10)   Motor R IN4   → PB3 (D11)
+ *   PWM Left ENA  → PD5 (D5)    PWM Right ENB → PD6 (D6)
+ *   Enc A Left    → PD7 (D7)    PCINT23
+ *   Enc B Left    → PD2 (D2)    direction sense
+ *   Enc A Right   → PB5 (D13)   PCINT5
+ *   Enc B Right   → PB4 (D12)   PCINT4
+ *   UART TX       → PD1 (D1)    9600 baud
  *
- * FSM States:
- *   FORWARD       – drive straight, hugging the right wall
- *   TURN_LEFT     – executing a 90° left turn
- *   TURN_RIGHT    – executing a 90° right turn
- *   WALL_LOST     – neither IR sees a wall; creep and re-acquire
- *   STOP          – track complete or manual stop
+ * ==========================================================================
+ * ROOT CAUSE OF WRONG DISTANCES (v11 → v12)
+ * ==========================================================================
  *
- * Turn detection logic (IR sensors – front-corner placement):
- *   left_wall=1, right_wall=1  → corridor, keep going straight
- *   left_wall=0, right_wall=1  → left opening → LEFT turn
- *   left_wall=1, right_wall=0  → right opening → RIGHT turn
- *   left_wall=0, right_wall=0  → WALL_LOST
+ * Both sensors physically work but consistently report ~8cm when the real
+ * distance is ~12cm — a 1.5× under-read on every measurement.
  *
- * Ultrasonic sensors are used to:
- *   • Keep side-wall distances within target range (wall hugging)
- *   • Detect a frontal obstacle that forces a turn
+ * The cause is in us_read_once(). We count loop iterations of _delay_us(1)
+ * and divide by 58 (the standard HC-SR04 µs-to-cm constant):
  *
- * Communication:
- *   After the track is complete (STOP state) the robot sends via UART:
- *     "Turns: N\r\nSequence: X, X, ...\r\n"
+ *     distance_cm = iteration_count / 58
  *
- * Coding rules:
- *   • Register-level drivers only – no Arduino APIs
- *   • Non-blocking design: all timing uses timer_get_ms()
- *   • Blocking delays only inside initialisation and turn manoeuvres
+ * But each iteration is NOT 1µs. At 16MHz with the compiler optimisation
+ * level used, _delay_us(1) = 16 cycles, plus the loop body overhead
+ * (PINC read, counter increment, compare, branch) adds ~7–8 cycles.
+ * Total ≈ 23–24 cycles ≈ 1.5µs per iteration.
+ *
+ * So the real formula is:
+ *     distance_cm = (iteration_count × 1.5µs) / 58µs_per_cm
+ *                 = iteration_count / (58 / 1.5)
+ *                 = iteration_count / 38.67
+ *                 → divisor = 39
+ *
+ * Verification: real 12cm → echo = 696µs → 696/1.5 = 464 iterations
+ *               464 / 39 = 11.9cm ≈ 12cm  ✓
+ *
+ * FIX: change the divisor from 58 to 39.
+ * The timeout threshold is scaled the same way (×1.5) so range is unchanged.
+ *
+ * With both sensors now accurate, DUAL-SENSOR mode is restored.
+ * error = dl - dr = 0 when centred — no TARGET_L constant needed,
+ * the control is self-calibrating regardless of car width.
+ *
+ * ==========================================================================
+ * OTHER ACTIVE FIXES (carried from v10/v11)
+ * ==========================================================================
+ *
+ * JUMP FILTER (double-echo / spike rejection):
+ *   Reject any reading that jumps more than JUMP_LIMIT cm from the previous
+ *   confirmed reading in one loop. Catches the 2× double-echo artefact and
+ *   single-sample spikes. Real wall drift at driving speed is <4cm per 90ms.
+ *   JUMP_LIMIT = 6cm catches artefacts while passing real movement.
+ *
+ * ENCODER PID GATING:
+ *   Encoder PID runs ONLY when |wall_error| ≤ WALL_DEADBAND.
+ *   When the wall PID is actively steering, encoder PID fighting it was
+ *   the primary cause of sinusoidal swerving. State is reset during
+ *   wall corrections so it doesn't burst when re-enabled.
+ *
+ * LOOP SPEED:
+ *   3-sample median with 20ms inter-ping gaps → ~90ms total loop.
+ *   PID gains tuned for this period.
+ *
+ * TIMER NOTE:
+ *   Timer1 is a 1ms CTC timer. TCNT1 is NOT used for echo timing here —
+ *   it would wrap every 1ms and corrupt measurements (previous bug).
+ *   Echo timing uses the _delay_us counting loop with divisor=39.
  */
 
-/* =========================================================================
- * Includes
- * ========================================================================= */
+ //el commentss de hattshalll lena for noww
+
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <util/atomic.h>
 #include <stdint.h>
+#include <util/delay.h>
 
-/* Application / module headers */
-#include "../drivers/sensors/IR/IR_sensor.h"
-#include "../drivers/uart/uart.h"
 #include "../drivers/timer/timer.h"
+#include "../drivers/uart/uart.h"
 #include "../modules/motor/motor.h"
 
 /* =========================================================================
- * Ultrasonic sensor pin configuration
+ * Ultrasonic
+ * =========================================================================
+ * US_DIVISOR = 39  (was 58 — see header for derivation)
+ * US_TIMEOUT  scaled by same 1.5× factor: 8000µs real → 5333 iterations
+ * JUMP_LIMIT  = 6cm — rejects double-echo and spikes, passes real drift
+ * ========================================================================= */
+#define US_LEFT_TRIG    2u
+#define US_LEFT_ECHO    3u
+#define US_RIGHT_TRIG   4u
+#define US_RIGHT_ECHO   5u
+#define US_MIN_CM       2u
+#define US_MAX_CM       60u
+#define US_DIVISOR      39u   /* calibrated: real_cm = iterations / 39 */
+#define US_TIMEOUT_ITER 5333u /* 8000µs / 1.5µs_per_iter               */
+#define JUMP_LIMIT      6u    /* cm — max valid change between loops    */
+
+/* =========================================================================
+ * Encoder pins
+ * ========================================================================= */
+#define ENC_L_A_BIT   7u
+#define ENC_L_B_BIT   2u
+#define ENC_R_A_BIT   5u
+#define ENC_R_B_BIT   4u
+
+/* =========================================================================
+ * Drive parameters  –  DO NOT CHANGE
+ * ========================================================================= */
+#define BASE_SPEED      150u
+#define MAX_SPEED       210u
+#define MIN_SPEED        60u
+
+/* Motor speed balance
+ * The left motor is mechanically stronger than the right.
+ * We balance by REDUCING right motor base speed instead of boosting left.
+ * This keeps absolute speeds lower and reduces oscillation.
  *
- * Three HC-SR04 sensors wired on PORTC:
- *   Front  : TRIG = PC0, ECHO = PC1
- *   Left   : TRIG = PC2, ECHO = PC3
- *   Right  : TRIG = PC4, ECHO = PC5
- * ========================================================================= */
-#define US_FRONT_TRIG_PIN   0   /* PC0 */
-#define US_FRONT_ECHO_PIN   1   /* PC1 */
-
-#define US_LEFT_TRIG_PIN    2   /* PC2 */
-#define US_LEFT_ECHO_PIN    3   /* PC3 */
-
-#define US_RIGHT_TRIG_PIN   4   /* PC4 */
-#define US_RIGHT_ECHO_PIN   5   /* PC5 */
+ * RIGHT_REDUCE: start at 20, increase by 5 if still swerves left.
+ *               decrease by 5 if swerves right.
+ * LEFT_TRIM must stay 0 when using RIGHT_REDUCE.               */
+#define LEFT_TRIM        0
+#define RIGHT_REDUCE     0   /* right motor base = BASE_SPEED - RIGHT_REDUCE */
 
 /* =========================================================================
- * Tunable parameters  (adjust during testing)
+ * Wall-centering PID
+ * error = dl - dr  (+ve → closer to right wall → steer left)
+ * Gains for ~90ms loop (3-sample median, 20ms inter-ping gaps).
  * ========================================================================= */
-#define BASE_SPEED          160     /* Normal forward PWM duty (0-255)       */
-#define TURN_SPEED_FAST     180     /* Outer wheel during correction          */
-#define TURN_SPEED_SLOW      80     /* Inner wheel during correction          */
-#define TURN_SPEED_SHARP    160     /* Both wheels during a 90° pivot         */
-
-#define WALL_TARGET_CM       15     /* Desired side-wall distance (cm)        */
-#define WALL_TOLERANCE_CM     4     /* ±4 cm dead-band before correcting      */
-#define FRONT_OBSTACLE_CM    20     /* Stop/turn when front US < this (cm)    */
-
-#define TURN_DURATION_MS    550     /* Time to execute one 90° turn (ms)      */
-                                    /* Tune on actual hardware                */
-#define WALL_LOST_CREEP_MS  300     /* Slow creep while searching for walls   */
-
-#define MAX_TURNS           32      /* Maximum turns to log                   */
-
-#define BAUD_RATE           9600UL
+#define WALL_KP             1.2f  /* reduced: first-loop overcorrection was swerving left */
+#define WALL_KI             0.04f
+#define WALL_KD             0.3f
+#define WALL_MAX_OUT        35.0f
+#define WALL_INTEGRAL_LIM   25.0f
+#define WALL_DEADBAND       1.5f   /* cm — above sensor noise floor      */
+#define WALL_DERIV_FILTER   0.55f
 
 /* =========================================================================
- * FSM state definitions
+ * Encoder PID  (active only when wall error is settled)
  * ========================================================================= */
-typedef enum {
-    STATE_FORWARD    = 0,
-    STATE_TURN_LEFT,
-    STATE_TURN_RIGHT,
-    STATE_WALL_LOST,
-    STATE_STOP
-} robot_state_t;
+#define ENC_KP              0.8f
+#define ENC_KI              0.0f
+#define ENC_KD              0.1f
+#define ENC_MAX_OUT         12.0f
+#define ENC_INTEGRAL_LIM    40.0f
 
 /* =========================================================================
- * Turn log
+ * Encoder ISRs
  * ========================================================================= */
-typedef enum { TURN_LEFT = 'L', TURN_RIGHT = 'R' } turn_dir_t;
+static volatile int32_t g_enc_left  = 0;
+static volatile int32_t g_enc_right = 0;
+static volatile uint8_t g_prev_pind = 0u;
+static volatile uint8_t g_prev_pinb = 0u;
 
-static uint8_t    g_turn_count            = 0;
-static turn_dir_t g_turn_log[MAX_TURNS];
-
-/* =========================================================================
- * Ultrasonic helper functions  (inline sensor read, no extra module needed)
- * ========================================================================= */
-
-/**
- * @brief  Read distance (cm) from one HC-SR04 on PORTC.
- *
- * @param  trig_pin  Bit number of TRIG pin in PORTC (0-5)
- * @param  echo_pin  Bit number of ECHO pin in PORTC (0-5)
- * @return Distance in cm, or 0 on timeout.
- */
-static uint16_t ultrasonic_read_cm(uint8_t trig_pin, uint8_t echo_pin)
+ISR(PCINT2_vect)
 {
-    uint32_t count = 0;
-
-    /* Send 10 µs trigger pulse */
-    PORTC |=  (1 << trig_pin);
-    timer_delay_us(10);
-    PORTC &= ~(1 << trig_pin);
-
-    /* Wait for echo to go HIGH (with timeout) */
-    count = 0;
-    while (!(PINC & (1 << echo_pin))) {
-        if (++count > 30000UL) return 0;   /* sensor not responding */
-    }
-
-    /* Measure echo HIGH duration */
-    count = 0;
-    while (PINC & (1 << echo_pin)) {
-        count++;
-        timer_delay_us(1);
-        if (count > 30000UL) break;        /* out-of-range (~5 m) */
-    }
-
-    /* distance = count / 58  (using 343 m/s speed of sound) */
-    return (uint16_t)(count / 58);
+    uint8_t cur = PIND, changed = cur ^ g_prev_pind;
+    g_prev_pind = cur;
+    if (changed & (1u << ENC_L_A_BIT))
+        if (cur & (1u << ENC_L_A_BIT))
+            g_enc_left += ((cur >> ENC_L_B_BIT) & 1u) ? 1 : -1;
 }
 
-/**
- * @brief  Init PORTC pins for all three ultrasonic sensors.
- */
-static void ultrasonic_init_all(void)
+ISR(PCINT0_vect)
 {
-    /* TRIG pins as outputs */
-    DDRC |=  (1 << US_FRONT_TRIG_PIN) |
-             (1 << US_LEFT_TRIG_PIN)  |
-             (1 << US_RIGHT_TRIG_PIN);
+    uint8_t cur = PINB, changed = cur ^ g_prev_pinb;
+    g_prev_pinb = cur;
+    if (changed & (1u << ENC_R_A_BIT))
+        if (cur & (1u << ENC_R_A_BIT))
+            g_enc_right += ((cur >> ENC_R_B_BIT) & 1u) ? 1 : -1;
+}
 
-    /* ECHO pins as inputs */
-    DDRC &= ~((1 << US_FRONT_ECHO_PIN) |
-              (1 << US_LEFT_ECHO_PIN)  |
-              (1 << US_RIGHT_ECHO_PIN));
+static void encoder_init(void)
+{
+    DDRD  &= ~((1u << ENC_L_A_BIT) | (1u << ENC_L_B_BIT));
+    PORTD |=  (1u << ENC_L_A_BIT)  | (1u << ENC_L_B_BIT);
+    DDRB  &= ~((1u << ENC_R_A_BIT) | (1u << ENC_R_B_BIT));
+    PORTB |=  (1u << ENC_R_A_BIT)  | (1u << ENC_R_B_BIT);
+    PCMSK2 |= (1u << PCINT23);
+    PCMSK0 |= (1u << PCINT5) | (1u << PCINT4);
+    PCICR  |= (1u << PCIE2)  | (1u << PCIE0);
+    g_prev_pind = PIND;
+    g_prev_pinb = PINB;
+}
 
-    /* Ensure TRIG lines start LOW */
-    PORTC &= ~((1 << US_FRONT_TRIG_PIN) |
-               (1 << US_LEFT_TRIG_PIN)  |
-               (1 << US_RIGHT_TRIG_PIN));
+static void enc_reset(void)
+{
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_enc_left = 0; g_enc_right = 0; }
+}
+
+static void enc_snapshot(int32_t *l, int32_t *r)
+{
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { *l = g_enc_left; *r = g_enc_right; }
 }
 
 /* =========================================================================
- * UART reporting helpers
+ * Ultrasonic
  * ========================================================================= */
-
-/**
- * @brief  Send a decimal integer over UART (no stdlib needed).
- */
-static void uart_send_uint(uint16_t value)
+static void ultrasonic_init(void)
 {
-    char buf[6];
-    uint8_t i = 0;
-
-    if (value == 0) {
-        UART_SendChar('0');
-        return;
-    }
-
-    while (value > 0) {
-        buf[i++] = '0' + (value % 10);
-        value   /= 10;
-    }
-
-    /* buf is in reverse order */
-    while (i > 0) {
-        UART_SendChar(buf[--i]);
-    }
+    DDRC  |=  (1u << US_LEFT_TRIG) | (1u << US_RIGHT_TRIG);
+    DDRC  &= ~((1u << US_LEFT_ECHO) | (1u << US_RIGHT_ECHO));
+    PORTC &= ~((1u << US_LEFT_TRIG) | (1u << US_RIGHT_TRIG));
 }
 
-/**
- * @brief  Transmit the full turn report to the PC.
- *
- * Output format (exactly as required):
- *   Turns: 5\r\n
- *   Sequence: L, R, R, L, L\r\n
- */
-static void report_send(void)
+static uint16_t us_read_once(uint8_t trig, uint8_t echo)
 {
-    UART_SendString("Turns: ");
-    uart_send_uint(g_turn_count);
-    UART_SendString("\r\nSequence: ");
+    uint16_t us;
 
-    for (uint8_t i = 0; i < g_turn_count; i++) {
-        UART_SendChar((char)g_turn_log[i]);
-        if (i < (uint8_t)(g_turn_count - 1)) {
-            UART_SendString(", ");
-        }
+    PORTC |=  (1u << trig);
+    _delay_us(10);
+    PORTC &= ~(1u << trig);
+
+    /* Wait for echo HIGH – timeout ~6ms */
+    for (us = 0u; !(PINC & (1u << echo)); ++us) {
+        _delay_us(1);
+        if (us > 4000u) return 0u;
     }
-    UART_SendString("\r\n");
+
+    /* Count iterations while echo HIGH.
+     * Each iteration ≈ 1.5µs (measured empirically: 12cm real → 8cm with /58,
+     * corrected to /39). Timeout = US_TIMEOUT_ITER iterations ≈ 8000µs.   */
+    for (us = 0u; PINC & (1u << echo); ++us) {
+        _delay_us(1);
+        if (us >= US_TIMEOUT_ITER) return 0u;
+    }
+
+    return (uint16_t)(us / US_DIVISOR);
+}
+
+/* 3-sample median, 20ms between pings → ~44ms per sensor, ~90ms total loop */
+static uint16_t us_read_median3(uint8_t trig, uint8_t echo)
+{
+    uint16_t s[3], tmp;
+    s[0] = us_read_once(trig, echo); timer_delay_ms(20u);
+    s[1] = us_read_once(trig, echo); timer_delay_ms(20u);
+    s[2] = us_read_once(trig, echo);
+    /* Sort network for 3 elements */
+    if (s[0] > s[1]) { tmp=s[0]; s[0]=s[1]; s[1]=tmp; }
+    if (s[1] > s[2]) { tmp=s[1]; s[1]=s[2]; s[2]=tmp; }
+    if (s[0] > s[1]) { tmp=s[0]; s[0]=s[1]; s[1]=tmp; }
+    return s[1]; /* median */
 }
 
 /* =========================================================================
- * Turn logging helper
+ * UART helpers
  * ========================================================================= */
-static void log_turn(turn_dir_t dir)
+static void uart_print_i16(int16_t v)
 {
-    if (g_turn_count < MAX_TURNS) {
-        g_turn_log[g_turn_count] = dir;
-    }
-    g_turn_count++;   /* Count even past MAX_TURNS; only log up to MAX */
+    char buf[7]; uint8_t i=0, neg=0;
+    if (v<0){neg=1;v=(int16_t)-v;}
+    if (v==0){UART_SendChar('0');return;}
+    while(v>0){buf[i++]=(char)('0'+(v%10));v/=10;}
+    if(neg) UART_SendChar('-');
+    while(i>0) UART_SendChar(buf[--i]);
+}
+static void uart_print_i32(int32_t v)
+{
+    char buf[12]; uint8_t i=0, neg=0;
+    if(v<0){neg=1;v=-v;}
+    if(v==0){UART_SendChar('0');return;}
+    while(v>0){buf[i++]=(char)('0'+(v%10));v/=10;}
+    if(neg) UART_SendChar('-');
+    while(i>0) UART_SendChar(buf[--i]);
 }
 
 /* =========================================================================
- * FSM – state handlers
- *
- * Each handler is called every loop iteration while in its state.
- * It returns the NEXT state (which may be itself for no transition).
+ * Wall PID  —  dual sensor, error = dl - dr
  * ========================================================================= */
+static float wall_integral       = 0.0f;
+static float wall_prev_error     = 0.0f;
+static float wall_deriv_filtered = 0.0f;
 
-/* -----------------------------------------------------------------------
- * STATE_FORWARD
- * Drive straight.  Use side ultrasonic sensors to hug the right wall.
- * IR sensors detect the entrance of a turn junction.
- * ----------------------------------------------------------------------- */
-static robot_state_t fsm_forward(void)
+static float wall_pid(float dl, float dr, float dt, float *raw_error_out)
 {
-    /* --- Read all sensors --- */
-    ir_snapshot_t ir = ir_read_all();
+    float error = dl - dr;
+    *raw_error_out = error;
 
-    uint16_t dist_front = ultrasonic_read_cm(US_FRONT_TRIG_PIN, US_FRONT_ECHO_PIN);
-    uint16_t dist_left  = ultrasonic_read_cm(US_LEFT_TRIG_PIN,  US_LEFT_ECHO_PIN);
-    uint16_t dist_right = ultrasonic_read_cm(US_RIGHT_TRIG_PIN, US_RIGHT_ECHO_PIN);
-
-    /* --- Check for frontal obstacle first (highest priority) --- */
-    if (dist_front > 0 && dist_front < FRONT_OBSTACLE_CM) {
-        Motor_Stop();
-        /*
-         * Decide turn direction from IR state.
-         * If both walls gone, default to left.
-         */
-        if (ir.right_wall) {
-            return STATE_TURN_LEFT;
-        } else {
-            return STATE_TURN_RIGHT;
-        }
+    if      (error >  WALL_DEADBAND) error -= WALL_DEADBAND;
+    else if (error < -WALL_DEADBAND) error += WALL_DEADBAND;
+    else {
+        error = 0.0f;
+        wall_integral *= 0.85f;
     }
 
-    /* --- IR: detect junction opening (turn entrance) --- */
-    if (!ir.left_wall && ir.right_wall) {
-        /* Left wall disappeared → Left junction ahead */
-        Motor_Stop();
-        return STATE_TURN_LEFT;
-    }
-    if (ir.left_wall && !ir.right_wall) {
-        /* Right wall disappeared → Right junction ahead */
-        Motor_Stop();
-        return STATE_TURN_RIGHT;
-    }
-    if (!ir.left_wall && !ir.right_wall) {
-        /* Both walls gone – open space or T-junction */
-        Motor_Stop();
-        return STATE_WALL_LOST;
-    }
+    float pre_clamp = WALL_KP * error + WALL_KI * wall_integral;
+    if (pre_clamp < WALL_MAX_OUT && pre_clamp > -WALL_MAX_OUT)
+        wall_integral += error * dt;
+    if (wall_integral >  WALL_INTEGRAL_LIM) wall_integral =  WALL_INTEGRAL_LIM;
+    if (wall_integral < -WALL_INTEGRAL_LIM) wall_integral = -WALL_INTEGRAL_LIM;
 
-    /* --- Wall-hugging correction with side ultrasonics --- */
-    /*
-     * Strategy: hug the right wall.
-     * If too close to right wall → steer left (slow right motor).
-     * If too far from right wall → steer right (slow left motor).
-     * Left wall distance used as secondary guard.
-     */
-    uint8_t left_speed  = BASE_SPEED;
-    uint8_t right_speed = BASE_SPEED;
+    float raw_d = (error - wall_prev_error) / dt;
+    wall_deriv_filtered = WALL_DERIV_FILTER * wall_deriv_filtered
+                        + (1.0f - WALL_DERIV_FILTER) * raw_d;
+    wall_prev_error = error;
 
-    /* Right wall correction */
-    if (dist_right > 0) {
-        int16_t error = (int16_t)dist_right - (int16_t)WALL_TARGET_CM;
-
-        if (error > (int16_t)WALL_TOLERANCE_CM) {
-            /* Too far from right wall → turn right slightly */
-            left_speed  = TURN_SPEED_FAST;
-            right_speed = TURN_SPEED_SLOW;
-        } else if (error < -(int16_t)WALL_TOLERANCE_CM) {
-            /* Too close to right wall → turn left slightly */
-            left_speed  = TURN_SPEED_SLOW;
-            right_speed = TURN_SPEED_FAST;
-        }
-    }
-
-    /* Left wall guard: if unexpectedly close, steer away */
-    if (dist_left > 0 && dist_left < (WALL_TARGET_CM - WALL_TOLERANCE_CM)) {
-        left_speed  = TURN_SPEED_SLOW;
-        right_speed = TURN_SPEED_FAST;
-    }
-
-    Motor_Forward(left_speed, right_speed);
-    return STATE_FORWARD;
-}
-
-/* -----------------------------------------------------------------------
- * STATE_TURN_LEFT
- * Execute a 90° left pivot, log the turn, then return to FORWARD.
- * Uses a time-based approach (tune TURN_DURATION_MS on hardware).
- * ----------------------------------------------------------------------- */
-static robot_state_t fsm_turn_left(void)
-{
-    log_turn(TURN_LEFT);
-
-    /*
-     * Pivot left: left motor reverse, right motor forward.
-     * The L298N Motor_TurnLeft currently runs both forward with
-     * differential speed; for a sharper 90° turn we drive directly
-     * via the motor module.  Replace with Motor_PivotLeft() if you
-     * add that function to motor.h.
-     */
-    Motor_TurnLeft(TURN_SPEED_SLOW, TURN_SPEED_SHARP);
-    timer_delay_ms(TURN_DURATION_MS);
-    Motor_Stop();
-    timer_delay_ms(50);           /* brief settle */
-
-    return STATE_FORWARD;
-}
-
-/* -----------------------------------------------------------------------
- * STATE_TURN_RIGHT
- * Execute a 90° right pivot, log the turn, then return to FORWARD.
- * ----------------------------------------------------------------------- */
-static robot_state_t fsm_turn_right(void)
-{
-    log_turn(TURN_RIGHT);
-
-    Motor_TurnRight(TURN_SPEED_SHARP, TURN_SPEED_SLOW);
-    timer_delay_ms(TURN_DURATION_MS);
-    Motor_Stop();
-    timer_delay_ms(50);
-
-    return STATE_FORWARD;
-}
-
-/* -----------------------------------------------------------------------
- * STATE_WALL_LOST
- * Creep slowly and poll ultrasonics until at least one wall is found.
- * If after WALL_LOST_CREEP_MS still nothing, try turning left (default).
- * ----------------------------------------------------------------------- */
-static robot_state_t fsm_wall_lost(void)
-{
-    uint32_t start = timer_get_ms();
-
-    while ((timer_get_ms() - start) < WALL_LOST_CREEP_MS) {
-        uint16_t dist_left  = ultrasonic_read_cm(US_LEFT_TRIG_PIN,  US_LEFT_ECHO_PIN);
-        uint16_t dist_right = ultrasonic_read_cm(US_RIGHT_TRIG_PIN, US_RIGHT_ECHO_PIN);
-
-        /* Re-acquired at least one wall */
-        if ((dist_left  > 0 && dist_left  < (WALL_TARGET_CM + 20)) ||
-            (dist_right > 0 && dist_right < (WALL_TARGET_CM + 20))) {
-            Motor_Stop();
-            return STATE_FORWARD;
-        }
-
-        /* Slow creep forward while searching */
-        Motor_Forward(BASE_SPEED / 2, BASE_SPEED / 2);
-    }
-
-    Motor_Stop();
-    /* Default recovery: turn left and try to re-acquire */
-    return STATE_TURN_LEFT;
-}
-
-/* -----------------------------------------------------------------------
- * STATE_STOP
- * Send the turn report once, then sit idle.
- * ----------------------------------------------------------------------- */
-static robot_state_t fsm_stop(void)
-{
-    Motor_Stop();
-    report_send();
-
-    /* Stay in STOP forever */
-    while (1) { /* idle */ }
-
-    return STATE_STOP;  /* unreachable, silences compiler warning */
+    float out = WALL_KP*error + WALL_KI*wall_integral + WALL_KD*wall_deriv_filtered;
+    if (out >  WALL_MAX_OUT) out =  WALL_MAX_OUT;
+    if (out < -WALL_MAX_OUT) out = -WALL_MAX_OUT;
+    return out;
 }
 
 /* =========================================================================
- * System initialisation
+ * Encoder PID
  * ========================================================================= */
-static void system_init(void)
+static float enc_integral   = 0.0f;
+static float enc_prev_error = 0.0f;
+
+static float enc_pid(int32_t l_ticks, int32_t r_ticks, float dt)
 {
-    /* 1. Timer driver (must be first – other modules may use timer_get_ms) */
-    timer_init();
+    const float ratio = (float)(BASE_SPEED) / (float)(BASE_SPEED - RIGHT_REDUCE);
+    float error = (float)l_ticks - ratio * (float)r_ticks;
+    enc_integral += error * dt;
+    if (enc_integral >  ENC_INTEGRAL_LIM) enc_integral =  ENC_INTEGRAL_LIM;
+    if (enc_integral < -ENC_INTEGRAL_LIM) enc_integral = -ENC_INTEGRAL_LIM;
+    float deriv    = (error - enc_prev_error) / dt;
+    enc_prev_error = error;
+    float out = ENC_KP*error + ENC_KI*enc_integral + ENC_KD*deriv;
+    if (out >  ENC_MAX_OUT) out =  ENC_MAX_OUT;
+    if (out < -ENC_MAX_OUT) out = -ENC_MAX_OUT;
+    return out;
+}
 
-    /* 2. UART @ 9600 baud */
-    UART_Init(BAUD_RATE);
-
-    /* 3. IR sensors (PD3, PD4 as inputs) */
-    ir_sensor_init();
-
-    /* 4. Ultrasonic sensors (PORTC) */
-    ultrasonic_init_all();
-
-    /* 5. Motors + PWM */
-    Motor_Init();
-
-    /* 6. Enable global interrupts (required for Timer0 CTC ISR) */
-    sei();
-
-    /* Brief startup delay to let sensors power up */
-    timer_delay_ms(500);
-
-    UART_SendString("Wall-follower ready.\r\n");
+static int16_t clamp16(int16_t v, int16_t lo, int16_t hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
 /* =========================================================================
@@ -436,39 +340,148 @@ static void system_init(void)
  * ========================================================================= */
 int main(void)
 {
-    system_init();
+    timer_init();
+    UART_Init(9600UL);
+    ultrasonic_init();
+    encoder_init();
+    Motor_Init();
+    sei();
 
-    robot_state_t state = STATE_FORWARD;
+    timer_delay_ms(500u);
+    UART_SendString("Wall-follower v13 ready.\r\n");
+    UART_SendString("L= R= e= W= EL= ER= E= LS= RS=\r\n");
 
-    while (1) {
-        switch (state) {
-            case STATE_FORWARD:
-                state = fsm_forward();
-                break;
+    /* ── Warm-up: take 5 sensor readings before starting motors ──────────
+     * Discards the first few noisy readings and seeds last_good with real
+     * values so the jump filter and PID start from a known-good baseline.
+     * Motors stay off during this phase.                                  */
+    uint16_t last_good_l = 15u;
+    uint16_t last_good_r = 15u;
 
-            case STATE_TURN_LEFT:
-                state = fsm_turn_left();
-                break;
-
-            case STATE_TURN_RIGHT:
-                state = fsm_turn_right();
-                break;
-
-            case STATE_WALL_LOST:
-                state = fsm_wall_lost();
-                break;
-
-            case STATE_STOP:
-                state = fsm_stop();    /* never returns */
-                break;
-
-            default:
-                /* Should never reach here; safe fallback */
-                Motor_Stop();
-                state = STATE_STOP;
-                break;
-        }
+    UART_SendString("Calibrating sensors...\r\n");
+    for (uint8_t wi = 0; wi < 5u; wi++) {
+        uint16_t wl = us_read_median3(US_LEFT_TRIG,  US_LEFT_ECHO);
+        uint16_t wr = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+        if (wl >= US_MIN_CM && wl <= US_MAX_CM) last_good_l = wl;
+        if (wr >= US_MIN_CM && wr <= US_MAX_CM) last_good_r = wr;
+        timer_delay_ms(50u);
     }
+    UART_SendString("Ready. L0="); 
+    /* print initial readings */
+    {
+        char buf[7]; uint8_t i=0;
+        uint16_t v = last_good_l;
+        if(v==0){UART_SendChar('0');}
+        else{while(v>0){buf[i++]=(char)('0'+(v%10));v/=10;} while(i>0)UART_SendChar(buf[--i]);}
+    }
+    UART_SendString(" R0=");
+    {
+        char buf[7]; uint8_t i=0;
+        uint16_t v = last_good_r;
+        if(v==0){UART_SendChar('0');}
+        else{while(v>0){buf[i++]=(char)('0'+(v%10));v/=10;} while(i>0)UART_SendChar(buf[--i]);}
+    }
+    UART_SendString("\r\n");
 
-    return 0;   /* unreachable */
+    uint8_t  sensor_valid = 1u;  /* warm-up guarantees valid baseline */
+    uint32_t prev_time = timer_get_ms();
+    enc_reset();
+
+    while (1)
+    {
+        /* --- 1. Sensor reads with jump filter --------------------------- */
+        uint16_t dl_raw = us_read_median3(US_LEFT_TRIG,  US_LEFT_ECHO);
+        uint16_t dr_raw = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+
+        uint16_t dl = last_good_l;
+        uint16_t dr = last_good_r;
+
+        if (dl_raw >= US_MIN_CM && dl_raw <= US_MAX_CM) {
+            uint16_t jump = (dl_raw > last_good_l)
+                          ? (dl_raw - last_good_l)
+                          : (last_good_l - dl_raw);
+            if (jump <= JUMP_LIMIT || sensor_valid == 0u) {
+                last_good_l = dl_raw;
+                dl = dl_raw;
+            }
+        }
+
+        if (dr_raw >= US_MIN_CM && dr_raw <= US_MAX_CM) {
+            uint16_t jump = (dr_raw > last_good_r)
+                          ? (dr_raw - last_good_r)
+                          : (last_good_r - dr_raw);
+            if (jump <= JUMP_LIMIT || sensor_valid == 0u) {
+                last_good_r = dr_raw;
+                dr = dr_raw;
+            }
+        }
+
+        if (last_good_l > 0u && last_good_r > 0u) sensor_valid = 1u;
+
+        /* --- 2. dt ------------------------------------------------------- */
+        uint32_t now = timer_get_ms();
+        float dt = (float)(now - prev_time) * 0.001f;
+        if (dt < 0.005f) dt = 0.005f;
+        prev_time = now;
+
+        /* --- 3. Encoder snapshot ----------------------------------------- */
+        int32_t el, er;
+        enc_snapshot(&el, &er);
+        enc_reset();
+
+        /* --- 4 & 5. PIDs ------------------------------------------------- */
+        float raw_err = 0.0f;
+        float w_corr  = 0.0f;
+        float e_corr  = 0.0f;
+
+        /* Grace period: skip first 2 loops to let speeds and sensors settle */
+        static uint8_t grace = 2u;
+        if (grace > 0u) { grace--; Motor_Forward((uint8_t)(BASE_SPEED), (uint8_t)(BASE_SPEED - RIGHT_REDUCE)); continue; }
+
+        if (sensor_valid)
+        {
+            w_corr = wall_pid((float)dl, (float)dr, dt, &raw_err);
+
+            /* Gate encoder PID: off during active wall corrections        */
+            float abs_err = raw_err < 0.0f ? -raw_err : raw_err;
+            if (abs_err <= WALL_DEADBAND)
+            {
+                e_corr = enc_pid(el, er, dt);
+            }
+            else
+            {
+                enc_integral   = 0.0f;
+                enc_prev_error = 0.0f;
+            }
+        }
+
+        /* --- 6. Drive ---------------------------------------------------- */
+        float total = w_corr + e_corr;
+
+        /* Sign convention:
+         *   error = L - R
+         *   +ve error → closer to RIGHT wall → steer LEFT
+         *              → speed up left, slow down right
+         *   total > 0 → add to left, subtract from right          */
+        int16_t ls = (int16_t)(BASE_SPEED)               + (int16_t)total;
+        int16_t rs = (int16_t)(BASE_SPEED - RIGHT_REDUCE) - (int16_t)total;
+
+        ls = clamp16(ls, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
+        rs = clamp16(rs, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
+
+        Motor_Forward((uint8_t)ls, (uint8_t)rs);
+
+        /* --- 7. Debug ---------------------------------------------------- */
+        UART_SendString("L=");  uart_print_i16((int16_t)dl);
+        UART_SendString(" R="); uart_print_i16((int16_t)dr);
+        UART_SendString(" e="); uart_print_i16((int16_t)raw_err);
+        UART_SendString(" W="); uart_print_i16((int16_t)w_corr);
+        UART_SendString(" EL=");uart_print_i32(el);
+        UART_SendString(" ER=");uart_print_i32(er);
+        UART_SendString(" E="); uart_print_i16((int16_t)e_corr);
+        UART_SendString(" LS=");uart_print_i16(ls);
+        UART_SendString(" RS=");uart_print_i16(rs);
+        UART_SendString("\r\n");
+    }
+    return 0;
 }
