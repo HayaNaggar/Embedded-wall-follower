@@ -49,4 +49,12 @@ void timer_delay_ms(uint32_t ms);
  */
 void timer_delay_us(uint16_t us);
 
+/**
+ * @brief  Return a combined microsecond timestamp: ms_ticks * 1000 + TCNT1/2.
+ * @return 32-bit microsecond count. Safe to call from main loop.
+ * @note   Handles the TCNT1 wrap-at-1ms edge case atomically.
+ *         Use two calls around an event to measure elapsed µs.
+ */
+uint32_t timer_get_us(void);
+
 #endif /* TIMER_H */

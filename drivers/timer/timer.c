@@ -122,3 +122,21 @@ void timer_delay_us(uint16_t us) {
         /* busy wait */
     }
 }
+
+uint32_t timer_get_us(void) {
+    uint32_t ms;
+    uint16_t tc;
+
+    /* Read ms counter and TCNT1 atomically so they correspond to the same
+     * instant. If OCF1A is already set but the ISR hasn't run yet (we are
+     * inside the atomic block), TCNT1 has just wrapped to near 0 and
+     * g_ms_ticks is one behind — compensate by adding 1ms. */
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        ms = g_ms_ticks;
+        tc = TCNT1;
+        if ((TIFR1 & (1u << OCF1A)) && tc < 500u) ms++;
+    }
+
+    /* tc counts at 2 ticks/µs (prescaler=8, F_CPU=16MHz → 0.5µs/tick) */
+    return ms * 1000UL + (uint32_t)(tc >> 1);
+}
