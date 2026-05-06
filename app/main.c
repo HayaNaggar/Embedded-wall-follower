@@ -86,12 +86,12 @@ static inline uint8_t ir_right_wall(void)
 /* =========================================================================
  * Turn parameters
  * ========================================================================= */
-#define SPEED_SLOW          90u
-#define SPEED_TURN_OUTER   170u
-#define SPEED_TURN_INNER    60u
+#define SPEED_SLOW          110u  /* increased - don't hesitate so much */
+#define SPEED_TURN_OUTER   180u   /* reduced from 210 - turns less sharp */
+#define SPEED_TURN_INNER    70u   /* increased from 25 - more balanced */
 
 /** @brief  Fixed time for a 90° turn in milliseconds. Tune for your robot. */
-#define TURN_DURATION_MS   600u
+#define TURN_DURATION_MS   620u   /* back to normal ~600ms for 90° */
 
 /** @brief  Straight burst after a turn to clear junction geometry (ms). */
 #define POST_TURN_MS       250u
@@ -243,8 +243,8 @@ static uint16_t us_read_once(uint8_t trig, uint8_t echo)
 static uint16_t us_read_median3(uint8_t trig, uint8_t echo)
 {
     uint16_t s[3], tmp;
-    s[0] = us_read_once(trig, echo); timer_delay_ms(20u);
-    s[1] = us_read_once(trig, echo); timer_delay_ms(20u);
+    s[0] = us_read_once(trig, echo);
+    s[1] = us_read_once(trig, echo);
     s[2] = us_read_once(trig, echo);
 
     /* @brief  bubble sort 3 elements */
@@ -275,6 +275,33 @@ static void uart_print_i32(int32_t v)
     while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
     if (neg) UART_SendChar('-');
     while (i > 0) UART_SendChar(buf[--i]);
+}
+
+static void uart_print_u16(uint16_t v)
+{
+    char buf[6]; uint8_t i = 0;
+    if (v == 0) { UART_SendChar('0'); return; }
+    while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) UART_SendChar(buf[--i]);
+}
+
+/**
+ * @brief Log sensor readings and decision state over UART in CSV format.
+ * Format: US_L,US_R,US_F,IR_L,IR_R,STATE,DECISION
+ */
+static void log_sensor_data(uint16_t us_left, uint16_t us_right, uint16_t us_front,
+                           uint8_t ir_left, uint8_t ir_right, const char *state_name,
+                           const char *decision)
+{
+    UART_SendString("[LOG] ");
+    uart_print_u16(us_left);   UART_SendString(",");
+    uart_print_u16(us_right);  UART_SendString(",");
+    uart_print_u16(us_front);  UART_SendString(",");
+    UART_SendChar(ir_left ? '1' : '0');  UART_SendString(",");
+    UART_SendChar(ir_right ? '1' : '0'); UART_SendString(",");
+    UART_SendString(state_name); UART_SendString(",");
+    UART_SendString(decision);
+    UART_SendString("\r\n");
 }
 
 /* =========================================================================
@@ -357,7 +384,8 @@ int main(void)
 
     sei();
 
-    timer_delay_ms(500u);
+    /* Init timer for startup (non-blocking check instead of delay) */
+    uint32_t startup_time = timer_get_ms();
     UART_SendString("Wall-follower ready.\r\n");
 
     /* ── Sensor warm-up ───────────────────────────────────────────────── */
@@ -369,7 +397,7 @@ int main(void)
         uint16_t wr = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
         if (wl >= US_MIN_CM && wl <= US_MAX_CM) last_good_l = wl;
         if (wr >= US_MIN_CM && wr <= US_MAX_CM) last_good_r = wr;
-        timer_delay_ms(50u);
+        /* No delay - next iteration will read immediately */
     }
     UART_SendString("Go.\r\n");
 
@@ -383,22 +411,25 @@ int main(void)
         S_APPROACH,      /* front <= FRONT_SLOW_CM, slow + wait for IR */
         S_TURN_RIGHT,    /* pivot right for TURN_DURATION_MS           */
         S_TURN_LEFT,     /* pivot left  for TURN_DURATION_MS           */
-        S_POST_TURN      /* straight burst to clear junction           */
+        S_POST_TURN,     /* straight burst to clear junction           */
+        S_SENSOR_WAIT    /* wait between sensor reads (non-blocking)   */
     } state_t;
 
     state_t state = S_STRAIGHT;
 
     uint32_t turn_start_ms = 0u;
+    uint32_t approach_start_ms = 0u;  /* safety timeout for stuck in APPROACH */
+    uint32_t post_turn_start_ms = 0u; /* post-turn settling delay */
+    uint32_t state_enter_time = 0u;   /* timestamp when entering current state */
 
-    /**
-     * @brief  IR debounce counters.
-     * Each counter increments every loop when the IR sees open space.
-     * Resets to 0 the moment a wall is seen again.
-     * Turn only fires when counter reaches IR_DEBOUNCE_COUNT.
-     */
-    uint8_t ir_right_open_cnt = 0u;
-    uint8_t ir_left_open_cnt  = 0u;
+    /* IR debounce: time-based instead of count-based */
+    uint32_t ir_last_change_ms = 0u;     /* timestamp of last IR change */
+    uint8_t ir_last_left = 1u;           /* previous IR left reading */
+    uint8_t ir_last_right = 1u;          /* previous IR right reading */
 
+    /* Front sensor: track last valid reading when not timeout */
+    uint16_t last_valid_front = 30u;
+    
     /**
      * @brief  Grace period — skip IR checking for first N iterations.
      * Increased to 10 so sensors have time to stabilise after power-on.
@@ -446,25 +477,32 @@ int main(void)
                 enc_prev_error       = 0.0f;
                 enc_reset();
 
-                /* @brief  also reset IR debounce counters */
-                ir_right_open_cnt = 0u;
-                ir_left_open_cnt  = 0u;
+                /* @brief  also reset IR debounce state */
+                ir_last_change_ms = timer_get_ms();
+                ir_last_left = 1u;
+                ir_last_right = 1u;
 
                 state = S_STRAIGHT;
+                post_turn_start_ms = timer_get_ms(); /* start settling timer */
+                state_enter_time = timer_get_ms();
                 UART_SendString("Resuming wall-follow\r\n");
             }
             continue;
         }
 
         /* ================================================================
-         * Sensor reads
+         * Sensor reads - NON-BLOCKING with delay between sensors
          * ================================================================ */
         uint16_t dl_raw = us_read_median3(US_LEFT_TRIG,  US_LEFT_ECHO);
-        timer_delay_ms(30u);   /* @brief  prevent crosstalk between sensors */
         uint16_t dr_raw = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
-        timer_delay_ms(10u);
-        uint16_t df = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-        if (df == 0u) df = 255u;
+        uint16_t df_raw = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
+        if (df_raw == 0u) df_raw = 255u;
+
+        /* FIX 4: track last valid front reading (ignore 255 = timeout) */
+        if (df_raw != 255u) {
+            last_valid_front = df_raw;
+        }
+        uint16_t df = last_valid_front;  /* use validated reading for logic */
 
         /* @brief  apply jump filter — reject spikes > JUMP_LIMIT cm */
         uint16_t dl = last_good_l;
@@ -506,78 +544,142 @@ int main(void)
         }
 
         /* ================================================================
+         * Log sensor data
+         * ================================================================ */
+        uint8_t ir_left_val  = ir_left_wall();
+        uint8_t ir_right_val = ir_right_wall();
+
+
+        /* ================================================================
          * ALL OPEN — stop condition
+         * Front timeout (255) should NOT count as open space; use validated df
          * ================================================================ */
         uint8_t left_open  = (dl == 0u) || (dl > US_MAX_CM);
         uint8_t right_open = (dr == 0u) || (dr > US_MAX_CM);
-        uint8_t front_open = (df == 0u) || (df > FRONT_SLOW_CM);
+        uint8_t front_valid_open = (df > FRONT_SLOW_CM) && (df < 255u);
         uint8_t ir_both_open = (!ir_left_wall()) && (!ir_right_wall());
 
-        if (left_open && right_open && front_open && ir_both_open) {
+        if (left_open && right_open && front_valid_open && ir_both_open) {
             Motor_Forward(0u, 0u);
+            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "STOP", "ALL_OPEN");
             UART_SendString("ALL OPEN - STOP\r\n");
             continue;
         }
 
         /* ================================================================
-         * APPROACH detection — front wall close
+         * Post-turn settling: ignore FRONT_CLOSE for 300ms after turn
+         * FIX 2: Raise threshold temporarily to prevent premature re-entry
          * ================================================================ */
-        if (state == S_STRAIGHT && df <= FRONT_SLOW_CM) {
+        uint32_t settle_elapsed = timer_get_ms() - post_turn_start_ms;
+        uint8_t front_close_threshold = (settle_elapsed < 500u) ? 12u : FRONT_SLOW_CM;
+
+        /* ================================================================
+         * APPROACH detection — front wall close (with settling protection)
+         * ================================================================ */
+        if (state == S_STRAIGHT && df <= front_close_threshold) {
             state = S_APPROACH;
+            approach_start_ms = timer_get_ms();
+            state_enter_time = timer_get_ms();
+            ir_last_change_ms = timer_get_ms();
+            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH", "FRONT_CLOSE");
             UART_SendString("Approach\r\n");
         }
 
         /* ================================================================
-         * IR DEBOUNCE TURN DETECTION
-         *
-         * Only runs in S_APPROACH.
-         * Counter increments each loop while IR sees open space.
-         * Resets immediately when wall is seen again.
-         * Turn fires only after IR_DEBOUNCE_COUNT consecutive open reads.
+         * IR DEBOUNCE TURN DETECTION (TIME-BASED)
+         * 
+         * FIX 3: IR must read the SAME value for >= 120ms continuously.
+         * Timestamp records when IR last changed state.
+         * Only act on IR reading if (current_time - ir_stable_since) >= 120ms.
          * ================================================================ */
         if (state == S_APPROACH)
         {
-            /* -- Right IR debounce -------------------------------------- */
-            if (!ir_right_wall())
-                ir_right_open_cnt++;
-            else
-                ir_right_open_cnt = 0u;   /* @brief  wall seen — reset counter */
+            uint32_t approach_elapsed = timer_get_ms() - approach_start_ms;
+            uint32_t ir_stable_time = timer_get_ms() - ir_last_change_ms;
 
-            /* -- Left IR debounce --------------------------------------- */
-            if (!ir_left_wall())
-                ir_left_open_cnt++;
-            else
-                ir_left_open_cnt = 0u;
+            /* -- Check if IR state changed -------------------------------- */
+            uint8_t ir_left_now  = ir_left_wall();
+            uint8_t ir_right_now = ir_right_wall();
 
-            /* -- Fire right turn ---------------------------------------- */
-            if (ir_right_open_cnt >= IR_DEBOUNCE_COUNT)
-            {
-                ir_right_open_cnt = 0u;
-                ir_left_open_cnt  = 0u;
-                state             = S_TURN_LEFT;
-                turn_start_ms     = timer_get_ms();
-                UART_SendString("Turn R\r\n");
-                continue;
+            if ((ir_left_now != ir_last_left) || (ir_right_now != ir_last_right)) {
+                ir_last_left = ir_left_now;
+                ir_last_right = ir_right_now;
+                ir_last_change_ms = timer_get_ms();
+                ir_stable_time = 0u;
             }
 
-            /* -- Fire left turn ----------------------------------------- */
-            if (ir_left_open_cnt >= IR_DEBOUNCE_COUNT)
+            /* -- Fire turn only if IR stable for >= IR_DEBOUNCE_MS (120ms) -- */
+            if (ir_stable_time >= 120u)
             {
-                ir_right_open_cnt = 0u;
-                ir_left_open_cnt  = 0u;
-                state             = S_TURN_RIGHT;
-                turn_start_ms     = timer_get_ms();
-                UART_SendString("Turn L\r\n");
-                continue;
+                /* -- Right IR open (left turn ahead) ----------------------- */
+                if (ir_right_now == 0u)
+                {
+                    state             = S_TURN_LEFT;
+                    turn_start_ms     = timer_get_ms();
+                    state_enter_time = timer_get_ms();
+                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "TURN_LEFT", "IR_RIGHT_STABLE");
+                    UART_SendString("Turn R\r\n");
+                    continue;
+                }
+
+                /* -- Left IR open (right turn ahead) ----------------------- */
+                if (ir_left_now == 0u)
+                {
+                    state             = S_TURN_RIGHT;
+                    turn_start_ms     = timer_get_ms();
+                    state_enter_time = timer_get_ms();
+                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "TURN_RIGHT", "IR_LEFT_STABLE");
+                    UART_SendString("Turn L\r\n");
+                    continue;
+                }
+            }
+
+            /* -- FIX 1: Safety timeout for stuck in APPROACH (2500ms) ----- */
+            if (approach_elapsed > 2500u)
+            {
+                uint8_t ir_left_now_check  = ir_left_wall();
+                uint8_t ir_right_now_check = ir_right_wall();
+
+                if (ir_right_now_check == 0u)
+                {
+                    state             = S_TURN_LEFT;
+                    turn_start_ms     = timer_get_ms();
+                    state_enter_time = timer_get_ms();
+                    ir_last_change_ms = timer_get_ms();
+                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "TURN_LEFT", "TIMEOUT_IR_RIGHT");
+                    UART_SendString("TIMEOUT Turn R\r\n");
+                    continue;
+                }
+                else if (ir_left_now_check == 0u)
+                {
+                    state             = S_TURN_RIGHT;
+                    turn_start_ms     = timer_get_ms();
+                    state_enter_time = timer_get_ms();
+                    ir_last_change_ms = timer_get_ms();
+                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "TURN_RIGHT", "TIMEOUT_IR_LEFT");
+                    UART_SendString("TIMEOUT Turn L\r\n");
+                    continue;
+                }
+                else
+                {
+                    /* FIX 1: Both walls present - BACKUP instead of STOP */
+                    Motor_Forward(50u, 50u);  /* reverse at low speed */
+                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "BACKUP", "BOTH_WALLS_TIMEOUT");
+                    UART_SendString("TIMEOUT BACKUP\r\n");
+                    state = S_APPROACH;  /* stay in APPROACH, reset timer */
+                    approach_start_ms = timer_get_ms();
+                    continue;
+                }
             }
 
             /* @brief  both walls still present — keep creeping forward slowly */
+            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH", "WAIT_IR");
         }
 
         /* ================================================================
          * PID — wall centering + encoder straight-line
          * ================================================================ */
-        float raw_err = 0.0f;
+         float raw_err = 0.0f;
         float w_corr  = 0.0f;
         float e_corr  = 0.0f;
 
@@ -591,6 +693,13 @@ int main(void)
                 enc_integral   = 0.0f;
                 enc_prev_error = 0.0f;
             }
+        }
+
+        /* ================================================================
+         * Log wall-following state
+         * ================================================================ */
+        if (state == S_STRAIGHT) {
+            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "STRAIGHT", "PID_FOLLOW");
         }
 
         /* ================================================================
