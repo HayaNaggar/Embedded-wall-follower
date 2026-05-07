@@ -63,12 +63,18 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u << IR_RIGHT_BIT))
 /* =========================================================================
  * Turn / speed parameters
  * ========================================================================= */
-#define SPEED_SLOW          160u
+#define SPEED_SLOW          155u   /* approach speed (df <= FRONT_SLOW_CM)  */
+#define SPEED_CREEP         130u   /* creep speed   (df <= FRONT_CREEP_CM)  */
+#define FRONT_CREEP_CM       18u   /* second slow-down threshold             */
 #define SPEED_TURN_OUTER    230u
 #define SPEED_TURN_INNER    110u
 #define SPEED_TURN_L_INNER  150u
-#define TURN_DURATION_MS    900u
+#define TURN_DURATION_MS    900u   /* safety timeout only — enc exits first  */
 #define POST_TURN_MS        250u
+
+/* Encoder ticks for a 90° pivot.
+ * Tune this on your robot: run one turn, read T ticks from UART, set here. */
+#define TURN_90_TICKS       55u
 
 /* =========================================================================
  * Encoder pins
@@ -231,15 +237,6 @@ static void uart_print_i16(int16_t v) {
     while (i > 0) UART_SendChar(buf[--i]);
 }
 
-static void uart_print_i32(int32_t v) {
-    char buf[12];
-    uint8_t i = 0, neg = 0;
-    if (v < 0) { neg = 1; v = -v; }
-    if (v == 0) { UART_SendChar('0'); return; }
-    while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
-    if (neg) UART_SendChar('-');
-    while (i > 0) UART_SendChar(buf[--i]);
-}
 
 static void uart_print_u16(uint16_t v) {
     char buf[6];
@@ -366,20 +363,24 @@ int main(void) {
                 Motor_TurnLeft(SPEED_TURN_L_INNER, SPEED_TURN_OUTER);
 
             uint32_t elapsed = timer_get_ms() - turn_start_ms;
-            if (elapsed >= 500u) {
-                uint16_t df_t      = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-                if (df_t == 0u) df_t = 255u;
-                uint8_t  ir_l_t    = ir_left_wall();
-                uint8_t  ir_r_t    = ir_right_wall();
-                uint8_t  front_clear = (df_t  > FRONT_SLOW_CM);
-                uint8_t  ir_aligned  = (ir_l_t && ir_r_t);
-                uint8_t  timed_out   = (elapsed >= TURN_DURATION_MS);
 
-                if ((front_clear && ir_aligned) || timed_out) {
-                    if      (ir_aligned && front_clear) UART_SendString("Turn done (IR+front)\r\n");
-                    else if (ir_aligned)                UART_SendString("Turn done (IR)\r\n");
-                    else if (front_clear)               UART_SendString("Turn done (front)\r\n");
-                    else                                UART_SendString("Turn done (timeout)\r\n");
+            /* Read total absolute encoder ticks since turn started */
+            int32_t enc_l_snap, enc_r_snap;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                enc_l_snap = g_enc_left;
+                enc_r_snap = g_enc_right;
+            }
+            int32_t abs_l = (enc_l_snap < 0) ? -enc_l_snap : enc_l_snap;
+            int32_t abs_r = (enc_r_snap < 0) ? -enc_r_snap : enc_r_snap;
+            uint8_t enc_done = ((abs_l + abs_r) >= (int32_t)TURN_90_TICKS);
+
+            /* 200ms minimum guard — let the robot physically start pivoting */
+            if (elapsed >= 200u) {
+                uint8_t timed_out = (elapsed >= TURN_DURATION_MS);
+
+                if (enc_done || timed_out) {
+                    if (enc_done)   UART_SendString("Turn done (enc)\r\n");
+                    else            UART_SendString("Turn done (timeout)\r\n");
 
                     state         = S_POST_TURN;
                     turn_start_ms = timer_get_ms();
@@ -543,6 +544,7 @@ int main(void) {
 
                 if (r_open && !l_open) {
                     if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'L';
+                    enc_reset();
                     state           = S_TURN_LEFT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 0u;
@@ -551,6 +553,7 @@ int main(void) {
                 }
                 if (l_open && !r_open) {
                     if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'R';
+                    enc_reset();
                     state           = S_TURN_RIGHT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 1u;
@@ -566,6 +569,7 @@ int main(void) {
 
                 if (ir_r_chk == 0u) {
                     if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'L';
+                    enc_reset();
                     state             = S_TURN_LEFT;
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 0u;
@@ -574,6 +578,7 @@ int main(void) {
                     continue;
                 } else if (ir_l_chk == 0u) {
                     if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'R';
+                    enc_reset();
                     state             = S_TURN_RIGHT;
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 1u;
@@ -603,7 +608,13 @@ int main(void) {
         /* ================================================================
          * Drive
          * ================================================================ */
-        uint8_t base = (state == S_APPROACH) ? SPEED_SLOW : (uint8_t)BASE_SPEED;
+        uint8_t base;
+        if (state != S_APPROACH)
+            base = (uint8_t)BASE_SPEED;
+        else if (df <= FRONT_CREEP_CM)
+            base = SPEED_CREEP;   /* very close — creep */
+        else
+            base = SPEED_SLOW;    /* approach zone      */
         int16_t ls = (int16_t)base + (int16_t)w_corr;
         int16_t rs = (int16_t)(base - RIGHT_REDUCE) - (int16_t)w_corr;
         ls = clamp16(ls, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
