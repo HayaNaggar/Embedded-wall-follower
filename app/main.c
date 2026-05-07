@@ -1,31 +1,27 @@
 /**
  * @file    main.c
  * @brief   Wall-following robot – ATmega328P / Arduino Nano
- *          Wall-centre PID  +  Encoder straight-line PID
- *          + IR-based turn detection with debounce fix
  *
  * PIN ASSIGNMENTS
  *   US Left  TRIG → PC2 (A2)    US Left  ECHO → PC3 (A3)
  *   US Right TRIG → PC4 (A4)    US Right ECHO → PC5 (A5)
  *   US Front TRIG → PC0 (A0)    US Front ECHO → PC1 (A1)
- *   Motor L IN1   → PB0 (D8)    Motor L IN2   → PB1 (D9)
- *   Motor R IN3   → PB2 (D10)   Motor R IN4   → PB3 (D11)
+ *   Motor L IN1   → PB0 (D8)    Motor L IN2   → PB1 (D9)   [physical RIGHT motor]
+ *   Motor R IN3   → PB2 (D10)   Motor R IN4   → PB3 (D11)  [physical LEFT motor]
  *   PWM Left ENA  → PD5 (D5)    PWM Right ENB → PD6 (D6)
- *   Enc A Left    → PD7 (D7)    PCINT23
- *   Enc B Left    → PD2 (D2)    direction sense
- *   Enc A Right   → PB5 (D13)   PCINT5
- *   Enc B Right   → PB4 (D12)   PCINT4
- *   IR Left       → PD3 (D3)
- *   IR Right      → PD4 (D4)
+ *   Enc A Left    → PB4 (D12)   PCINT4  (physical left wheel)
+ *   Enc B Left    → PB5 (D13)   direction sense (read only)
+ *   Enc A Right   → PD7 (D7)    PCINT23 (physical right wheel)
+ *   Enc B Right   → PD2 (D2)    direction sense
+ *   IR Left       → PD3 (D3)    [physical RIGHT side sensor]
+ *   IR Right      → PD4 (D4)    [physical LEFT  side sensor]
  *   UART TX       → PD1 (D1)    9600 baud
  *
- * FIXES APPLIED
- *   1. IR debounce – must see open space IR_DEBOUNCE_COUNT times in a row
- *      before a turn is triggered. Prevents false turns from flicker.
- *   2. Grace period increased to 10 iterations so IR is not trusted at boot.
- *   3. FRONT_SLOW_CM reduced to 30 cm so approach only fires when truly close.
- *   4. Turn exit is purely time-based (600 ms) – no IR dependency during turn.
- *   5. Post-turn straight burst (250 ms) before PID re-engages.
+ * PID SIGN (verified)
+ *   error = dl - dr  (positive = robot right-of-centre, dl large, dr small)
+ *   Positive output → code-"left" motor faster → physical RIGHT motor faster
+ *   → robot steers LEFT → corrects rightward drift  ✓
+ *   Motors physically swapped so the sign works out correctly.
  */
 
 #include <avr/interrupt.h>
@@ -38,114 +34,96 @@
 #include "motor.h"
 
 /* =========================================================================
- * Ultrasonic – LEFT and RIGHT (wall following)
+ * Ultrasonic – side walls
  * ========================================================================= */
-#define US_LEFT_TRIG 2u
-#define US_LEFT_ECHO 3u
+#define US_LEFT_TRIG  2u
+#define US_LEFT_ECHO  3u
 #define US_RIGHT_TRIG 4u
 #define US_RIGHT_ECHO 5u
-#define US_MIN_CM 2u
-#define US_MAX_CM 60u
-#define US_TIMEOUT_ITER 5333u
-#define JUMP_LIMIT 6u
+#define US_MIN_CM     2u
+#define US_MAX_CM     60u
+#define JUMP_LIMIT    6u
 
 /* =========================================================================
- * Front ultrasonic – for turn detection
+ * Front ultrasonic
  * ========================================================================= */
-#define US_FRONT_TRIG 0u /* PC0 = A0 */
-#define US_FRONT_ECHO 1u /* PC1 = A1 */
-
-/** @brief  Slow down when front wall is closer than this (cm). */
-#define FRONT_SLOW_CM 30u /* was 50 – reduced to avoid false approach */
+#define US_FRONT_TRIG 0u
+#define US_FRONT_ECHO 1u
+#define FRONT_SLOW_CM 35u
 
 /* =========================================================================
- * IR sensors
- * IR output is LOW when wall present, HIGH when open space.
+ * IR sensors  (active-LOW: LOW = wall present, HIGH = open space)
  * ========================================================================= */
-#define IR_LEFT_BIT 3u  /* PD3 = D3 */
-#define IR_RIGHT_BIT 4u /* PD4 = D4 */
+#define IR_LEFT_BIT  3u
+#define IR_RIGHT_BIT 4u
 
-/**
- * @brief  Number of consecutive open readings required before a turn fires.
- *         Increase this if your IR still flickers on white cardboard walls.
- *         At ~60 ms per main loop iteration, 8 counts ≈ 480 ms of open space.
- */
-#define IR_DEBOUNCE_COUNT 8u
-
-/** @brief  Returns 1 if wall is present, 0 if open space. */
-static inline uint8_t ir_left_wall(void) {
-    return (PIND & (1u << IR_LEFT_BIT)) ? 0u : 1u;
-}
-static inline uint8_t ir_right_wall(void) {
-    return (PIND & (1u << IR_RIGHT_BIT)) ? 0u : 1u;
-}
+static inline uint8_t ir_left_wall(void)  { return (PIND & (1u << IR_LEFT_BIT))  ? 0u : 1u; }
+static inline uint8_t ir_right_wall(void) { return (PIND & (1u << IR_RIGHT_BIT)) ? 0u : 1u; }
 
 /* =========================================================================
- * Turn parameters
+ * Turn / speed parameters
  * ========================================================================= */
-#define SPEED_SLOW        180u
-#define SPEED_TURN_OUTER  220u   /* outer wheel forward speed  */
-#define SPEED_TURN_INNER  110u   /* inner wheel backward speed */
-
-/* Sensor-based exit now fires first; this is the safety timeout only.
- * 900 ms is a generous upper bound for a full 90° pivot. */
-#define TURN_DURATION_MS  900u
-
-/** @brief  Straight burst after a turn to clear junction geometry (ms). */
-#define POST_TURN_MS 250u
+#define SPEED_SLOW          160u
+#define SPEED_TURN_OUTER    230u
+#define SPEED_TURN_INNER    110u
+#define SPEED_TURN_L_INNER  150u
+#define TURN_DURATION_MS    900u
+#define POST_TURN_MS        250u
 
 /* =========================================================================
  * Encoder pins
  * ========================================================================= */
-#define ENC_L_A_BIT 7u
+#define ENC_L_A_BIT 7u   /* PD7 = D7  — physically RIGHT wheel */
 #define ENC_L_B_BIT 2u
-#define ENC_R_A_BIT 5u
-#define ENC_R_B_BIT 4u
+#define ENC_R_A_BIT 4u   /* PB4 = D12 — physically LEFT wheel  */
+#define ENC_R_B_BIT 5u   /* PB5 = D13 — direction read only    */
 
 /* =========================================================================
  * Drive parameters
  * ========================================================================= */
-#define BASE_SPEED 230u
-#define MAX_SPEED  255u
-#define MIN_SPEED   80u
-#define LEFT_TRIM 0
-#define RIGHT_REDUCE 0
+#define BASE_SPEED   210u
+#define MAX_SPEED    255u
+#define MIN_SPEED     60u
+#define RIGHT_REDUCE    0
 
 /* =========================================================================
- * Wall PID gains
+ * Wall PID — PID with anti-windup
+ *
+ * KP lowered to 4 to prevent oscillation; KD re-added (median3 readings
+ * suppress sensor noise enough to make derivative useful).
+ * Anti-windup: integral does not accumulate when output is already clamped
+ * in the same direction as the current error.
  * ========================================================================= */
-#define WALL_KP 3.0f
-#define WALL_KI 0.08f
-#define WALL_KD 0.6f
-#define WALL_MAX_OUT 70.0f
-#define WALL_INTEGRAL_LIM 30.0f
-#define WALL_DEADBAND 0.5f
-#define WALL_DERIV_FILTER 0.3f
+#define WALL_KP            7.0f
+#define WALL_KI            0.3f
+#define WALL_KD            0.3f
+#define WALL_MAX_OUT      75.0f
+#define WALL_INTEGRAL_LIM 50.0f
+#define WALL_DEADBAND      0.5f
 
 /* =========================================================================
  * Post-turn single-wall realignment
- * After a right turn → follow left wall at REALIGN_TARGET_CM.
- * After a left  turn → follow right wall at REALIGN_TARGET_CM.
  * ========================================================================= */
-#define POST_TURN_REALIGN_MS   600u   /* duration of single-wall follow phase */
-#define REALIGN_TARGET_CM      12.5f  /* desired distance from the near wall   */
-#define REALIGN_KP             4.0f   /* P-only, error = wall_dist - target    */
-#define REALIGN_MAX_OUT        60.0f
-#define REALIGN_SPEED          180u   /* base speed during realign             */
+#define POST_TURN_REALIGN_MS  600u
+#define REALIGN_TARGET_CM    12.5f
+#define REALIGN_KP            4.0f
+#define REALIGN_MAX_OUT      60.0f
+#define REALIGN_SPEED        180u
 
 /* =========================================================================
- * Encoder PID gains
+ * Turn tracking — project output format:
+ *   Turns: 5
+ *   Sequence: L, R, R, L, L
  * ========================================================================= */
-#define ENC_KP 0.8f
-#define ENC_KI 0.0f
-#define ENC_KD 0.1f
-#define ENC_MAX_OUT 12.0f
-#define ENC_INTEGRAL_LIM 40.0f
+#define MAX_TURNS 30u
+
+static uint8_t turn_count = 0u;
+static char    turn_sequence[MAX_TURNS];
 
 /* =========================================================================
  * Encoder ISRs
  * ========================================================================= */
-static volatile int32_t g_enc_left = 0;
+static volatile int32_t g_enc_left  = 0;
 static volatile int32_t g_enc_right = 0;
 static volatile uint8_t g_prev_pind = 0u;
 static volatile uint8_t g_prev_pinb = 0u;
@@ -163,131 +141,80 @@ ISR(PCINT0_vect) {
     g_prev_pinb = cur;
     if (changed & (1u << ENC_R_A_BIT))
         if (cur & (1u << ENC_R_A_BIT))
-            g_enc_right += ((cur >> ENC_R_B_BIT) & 1u) ? 1 : -1;
+            g_enc_right += ((cur >> ENC_R_B_BIT) & 1u) ? -1 : 1;
 }
 
-/** @brief  Configure encoder pins as inputs with pull-ups, enable PCINT. */
 static void encoder_init(void) {
-    DDRD &= ~((1u << ENC_L_A_BIT) | (1u << ENC_L_B_BIT));
-    PORTD |= (1u << ENC_L_A_BIT) | (1u << ENC_L_B_BIT);
-    DDRB &= ~((1u << ENC_R_A_BIT) | (1u << ENC_R_B_BIT));
-    PORTB |= (1u << ENC_R_A_BIT) | (1u << ENC_R_B_BIT);
+    DDRD  &= ~((1u << ENC_L_A_BIT) | (1u << ENC_L_B_BIT));
+    PORTD |=  (1u << ENC_L_A_BIT)  | (1u << ENC_L_B_BIT);
+    DDRB  &= ~((1u << ENC_R_A_BIT) | (1u << ENC_R_B_BIT));
+    PORTB |=  (1u << ENC_R_A_BIT)  | (1u << ENC_R_B_BIT);
     PCMSK2 |= (1u << PCINT23);
-    PCMSK0 |= (1u << PCINT5) | (1u << PCINT4);
-    PCICR |= (1u << PCIE2) | (1u << PCIE0);
+    PCMSK0 |= (1u << PCINT4);   /* PB4 = D12 only; PB5/D13 LED excluded */
+    PCICR  |= (1u << PCIE2) | (1u << PCIE0);
     g_prev_pind = PIND;
     g_prev_pinb = PINB;
 }
 
-/** @brief  Reset both encoder counters atomically. */
 static void enc_reset(void) {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        g_enc_left = 0;
+        g_enc_left  = 0;
         g_enc_right = 0;
     }
 }
 
-/** @brief  Read both encoder counters atomically into provided pointers. */
-static void enc_snapshot(int32_t *l, int32_t *r) {
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        *l = g_enc_left;
-        *r = g_enc_right;
-    }
-}
 
 /* =========================================================================
  * Ultrasonic helpers
  * ========================================================================= */
-
-/** @brief  Init trig pins as output, echo pins as input. */
-static void ultrasonic_init(void)
-{
+static void ultrasonic_init(void) {
     DDRC |=  (1u<<US_LEFT_TRIG)|(1u<<US_RIGHT_TRIG)|(1u<<US_FRONT_TRIG);
     DDRC &= ~((1u<<US_LEFT_ECHO)|(1u<<US_RIGHT_ECHO)|(1u<<US_FRONT_ECHO));
     PORTC &= ~((1u<<US_LEFT_TRIG)|(1u<<US_RIGHT_TRIG)|(1u<<US_FRONT_TRIG));
 }
 
-/*
- * Microsecond timestamp: combines the 1ms project counter with TCNT1.
- * Timer1 prescaler=8, F_CPU=16MHz → 2 ticks/us, period=2000 ticks=1ms.
- * Resolution ~0.5 us.  Handles the CTC-reset boundary: if the compare
- * flag is already set but the ISR hasn't run yet, the ms count is
- * adjusted so the result is always monotonic.
- */
-static uint32_t us_now(void)
-{
+static uint32_t us_now(void) {
     uint32_t ms;
     uint16_t tc;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         tc = TCNT1;
         ms = timer_get_ms();
-        /* ISR pending but not yet serviced — ms is one behind */
         if ((TIFR1 & (1u << OCF1A)) && tc < 4u) ms++;
     }
-    return ms * 1000UL + (uint32_t)(tc >> 1u);  /* tc/2 converts ticks → us */
+    return ms * 1000UL + (uint32_t)(tc >> 1u);
 }
 
-/*
- * Send one trigger pulse and measure the echo duration.
- * All timing uses us_now() (project timer + TCNT1) — no _delay_us.
- * Returns distance in cm, or 0 on timeout / out-of-range.
- */
-static uint16_t us_read_once(uint8_t trig, uint8_t echo)
-{
-    /* Wait for any lingering echo to clear (up to 10 ms) */
+static uint16_t us_read_once(uint8_t trig, uint8_t echo) {
     uint32_t t0 = timer_get_ms();
-    while ((PINC & (1u << echo)) && (timer_get_ms() - t0) < 10u)
-        ;
+    while ((PINC & (1u << echo)) && (timer_get_ms() - t0) < 10u);
 
-    /* 10 µs trigger pulse measured by us_now() — no _delay_us */
     PORTC |= (1u << trig);
     uint32_t t_trig = us_now();
-    while ((us_now() - t_trig) < 10u)
-        ;
+    while ((us_now() - t_trig) < 10u);
     PORTC &= ~(1u << trig);
 
-    /* Wait for echo HIGH (4 ms timeout) */
     t0 = timer_get_ms();
     while (!(PINC & (1u << echo))) {
         if ((timer_get_ms() - t0) >= 4u) return 0u;
     }
 
-    /* Measure echo HIGH duration */
     uint32_t echo_start = us_now();
     while (PINC & (1u << echo)) {
-        if ((us_now() - echo_start) >= 8000u) return 0u;  /* 8 ms = ~136 cm */
+        if ((us_now() - echo_start) >= 8000u) return 0u;
     }
     uint32_t duration_us = us_now() - echo_start;
-
     if (duration_us == 0u) return 0u;
     return (uint16_t)(duration_us / 58u);
 }
 
-/**
- * @brief  Take 3 readings and return the median — rejects noise spikes.
- */
 static uint16_t us_read_median3(uint8_t trig, uint8_t echo) {
     uint16_t s[3], tmp;
     s[0] = us_read_once(trig, echo);
     s[1] = us_read_once(trig, echo);
     s[2] = us_read_once(trig, echo);
-
-    /* @brief  bubble sort 3 elements */
-    if (s[0] > s[1]) {
-        tmp = s[0];
-        s[0] = s[1];
-        s[1] = tmp;
-    }
-    if (s[1] > s[2]) {
-        tmp = s[1];
-        s[1] = s[2];
-        s[2] = tmp;
-    }
-    if (s[0] > s[1]) {
-        tmp = s[0];
-        s[0] = s[1];
-        s[1] = tmp;
-    }
+    if (s[0] > s[1]) { tmp=s[0]; s[0]=s[1]; s[1]=tmp; }
+    if (s[1] > s[2]) { tmp=s[1]; s[1]=s[2]; s[2]=tmp; }
+    if (s[0] > s[1]) { tmp=s[0]; s[0]=s[1]; s[1]=tmp; }
     return s[1];
 }
 
@@ -297,157 +224,78 @@ static uint16_t us_read_median3(uint8_t trig, uint8_t echo) {
 static void uart_print_i16(int16_t v) {
     char buf[7];
     uint8_t i = 0, neg = 0;
-    if (v < 0) {
-        neg = 1;
-        v = (int16_t)-v;
-    }
-    if (v == 0) {
-        UART_SendChar('0');
-        return;
-    }
-    while (v > 0) {
-        buf[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    if (neg)
-        UART_SendChar('-');
-    while (i > 0)
-        UART_SendChar(buf[--i]);
+    if (v < 0) { neg = 1; v = (int16_t)-v; }
+    if (v == 0) { UART_SendChar('0'); return; }
+    while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    if (neg) UART_SendChar('-');
+    while (i > 0) UART_SendChar(buf[--i]);
 }
 
 static void uart_print_i32(int32_t v) {
     char buf[12];
     uint8_t i = 0, neg = 0;
-    if (v < 0) {
-        neg = 1;
-        v = -v;
-    }
-    if (v == 0) {
-        UART_SendChar('0');
-        return;
-    }
-    while (v > 0) {
-        buf[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    if (neg)
-        UART_SendChar('-');
-    while (i > 0)
-        UART_SendChar(buf[--i]);
+    if (v < 0) { neg = 1; v = -v; }
+    if (v == 0) { UART_SendChar('0'); return; }
+    while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    if (neg) UART_SendChar('-');
+    while (i > 0) UART_SendChar(buf[--i]);
 }
 
 static void uart_print_u16(uint16_t v) {
     char buf[6];
     uint8_t i = 0;
-    if (v == 0) {
-        UART_SendChar('0');
-        return;
-    }
-    while (v > 0) {
-        buf[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (i > 0)
-        UART_SendChar(buf[--i]);
+    if (v == 0) { UART_SendChar('0'); return; }
+    while (v > 0) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) UART_SendChar(buf[--i]);
 }
 
-/**
- * @brief Log sensor readings and decision state over UART in CSV format.
- * Format: US_L,US_R,US_F,IR_L,IR_R,STATE,DECISION
- */
-static void log_sensor_data(uint16_t us_left, uint16_t us_right,
-                            uint16_t us_front, uint8_t ir_left,
-                            uint8_t ir_right, const char *state_name,
-                            const char *decision) {
-    UART_SendString("[LOG] ");
-    uart_print_u16(us_left);
-    UART_SendString(",");
-    uart_print_u16(us_right);
-    UART_SendString(",");
-    uart_print_u16(us_front);
-    UART_SendString(",");
-    UART_SendChar(ir_left ? '1' : '0');
-    UART_SendString(",");
-    UART_SendChar(ir_right ? '1' : '0');
-    UART_SendString(",");
-    UART_SendString(state_name);
-    UART_SendString(",");
-    UART_SendString(decision);
+/* Sends the required project report format over UART. */
+static void send_turn_report(void) {
+    UART_SendString("Turns: ");
+    uart_print_u16(turn_count);
+    UART_SendString("\r\nSequence: ");
+    for (uint8_t i = 0u; i < turn_count; i++) {
+        if (i > 0u) UART_SendString(", ");
+        UART_SendChar(turn_sequence[i]);
+    }
     UART_SendString("\r\n");
 }
 
 /* =========================================================================
  * Wall PID
  * ========================================================================= */
-static float wall_integral = 0.0f;
+static float wall_integral   = 0.0f;
 static float wall_prev_error = 0.0f;
-static float wall_deriv_filtered = 0.0f;
 
 static float wall_pid(float dl, float dr, float dt, float *raw_error_out) {
     float error = dl - dr;
     *raw_error_out = error;
 
-    if (error > WALL_DEADBAND)
-        error -= WALL_DEADBAND;
-    else if (error < -WALL_DEADBAND)
-        error += WALL_DEADBAND;
-    else {
-        error = 0.0f;
-        wall_integral *= 0.85f;
-    }
+    if      (error >  WALL_DEADBAND) error -= WALL_DEADBAND;
+    else if (error < -WALL_DEADBAND) error += WALL_DEADBAND;
+    else                             error  = 0.0f;
 
-    float pre_clamp = WALL_KP * error + WALL_KI * wall_integral;
-    if (pre_clamp < WALL_MAX_OUT && pre_clamp > -WALL_MAX_OUT)
+    /* Anti-windup: skip integration when already saturated in same direction */
+    float pre = WALL_KP * error + WALL_KI * wall_integral;
+    if (!((pre >= WALL_MAX_OUT && error > 0.0f) ||
+          (pre <= -WALL_MAX_OUT && error < 0.0f)))
         wall_integral += error * dt;
-    if (wall_integral > WALL_INTEGRAL_LIM)
-        wall_integral = WALL_INTEGRAL_LIM;
-    if (wall_integral < -WALL_INTEGRAL_LIM)
-        wall_integral = -WALL_INTEGRAL_LIM;
 
-    float raw_d = (error - wall_prev_error) / dt;
-    wall_deriv_filtered = WALL_DERIV_FILTER * wall_deriv_filtered +
-                          (1.0f - WALL_DERIV_FILTER) * raw_d;
+    if (wall_integral >  WALL_INTEGRAL_LIM) wall_integral =  WALL_INTEGRAL_LIM;
+    if (wall_integral < -WALL_INTEGRAL_LIM) wall_integral = -WALL_INTEGRAL_LIM;
+
+    float deriv = (error - wall_prev_error) / dt;
     wall_prev_error = error;
 
-    float out = WALL_KP * error + WALL_KI * wall_integral +
-                WALL_KD * wall_deriv_filtered;
-    if (out > WALL_MAX_OUT)
-        out = WALL_MAX_OUT;
-    if (out < -WALL_MAX_OUT)
-        out = -WALL_MAX_OUT;
-    return out;
-}
-
-/* =========================================================================
- * Encoder PID
- * ========================================================================= */
-static float enc_integral = 0.0f;
-static float enc_prev_error = 0.0f;
-
-static float enc_pid(int32_t l_ticks, int32_t r_ticks, float dt) {
-    const float ratio =
-        (float)(BASE_SPEED) / (float)(BASE_SPEED - RIGHT_REDUCE);
-    float error = (float)l_ticks - ratio * (float)r_ticks;
-    enc_integral += error * dt;
-    if (enc_integral > ENC_INTEGRAL_LIM)
-        enc_integral = ENC_INTEGRAL_LIM;
-    if (enc_integral < -ENC_INTEGRAL_LIM)
-        enc_integral = -ENC_INTEGRAL_LIM;
-    float deriv = (error - enc_prev_error) / dt;
-    enc_prev_error = error;
-    float out = ENC_KP * error + ENC_KI * enc_integral + ENC_KD * deriv;
-    if (out > ENC_MAX_OUT)
-        out = ENC_MAX_OUT;
-    if (out < -ENC_MAX_OUT)
-        out = -ENC_MAX_OUT;
+    float out = WALL_KP * error + WALL_KI * wall_integral + WALL_KD * deriv;
+    if (out >  WALL_MAX_OUT) out =  WALL_MAX_OUT;
+    if (out < -WALL_MAX_OUT) out = -WALL_MAX_OUT;
     return out;
 }
 
 static int16_t clamp16(int16_t v, int16_t lo, int16_t hi) {
-    if (v < lo)
-        return lo;
-    if (v > hi)
-        return hi;
+    if (v < lo) return lo;
+    if (v > hi) return hi;
     return v;
 }
 
@@ -455,106 +303,79 @@ static int16_t clamp16(int16_t v, int16_t lo, int16_t hi) {
  * Main
  * ========================================================================= */
 int main(void) {
-    /* ── Init ─────────────────────────────────────────────────────────── */
     timer_init();
     UART_Init(9600UL);
     ultrasonic_init();
     encoder_init();
     Motor_Init();
 
-    /* @brief  IR pins as inputs, no pull-up (sensor has its own output) */
-    DDRD &= ~((1u << IR_LEFT_BIT) | (1u << IR_RIGHT_BIT));
+    DDRD  &= ~((1u << IR_LEFT_BIT) | (1u << IR_RIGHT_BIT));
     PORTD &= ~((1u << IR_LEFT_BIT) | (1u << IR_RIGHT_BIT));
 
     sei();
 
     UART_SendString("Wall-follower ready.\r\n");
 
-    /* ── Sensor warm-up ───────────────────────────────────────────────── */
     uint16_t last_good_l = 15u;
     uint16_t last_good_r = 15u;
     UART_SendString("Calibrating...\r\n");
     for (uint8_t wi = 0; wi < 5u; wi++) {
         uint16_t wl = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
         uint16_t wr = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
-        if (wl >= US_MIN_CM && wl <= US_MAX_CM)
-            last_good_l = wl;
-        if (wr >= US_MIN_CM && wr <= US_MAX_CM)
-            last_good_r = wr;
-        /* No delay - next iteration will read immediately */
+        if (wl >= US_MIN_CM && wl <= US_MAX_CM) last_good_l = wl;
+        if (wr >= US_MIN_CM && wr <= US_MAX_CM) last_good_r = wr;
     }
     UART_SendString("Go.\r\n");
 
-    uint8_t sensor_valid = 1u;
-    uint32_t prev_time = timer_get_ms();
+    uint8_t  sensor_valid       = 1u;
+    uint32_t prev_time          = timer_get_ms();
     enc_reset();
 
-    /* ── State machine ────────────────────────────────────────────────── */
     typedef enum {
-        S_STRAIGHT = 0, /* normal wall-following PID                  */
-        S_APPROACH,     /* front <= FRONT_SLOW_CM, slow + wait for IR */
-        S_TURN_RIGHT,   /* pivot right for TURN_DURATION_MS           */
-        S_TURN_LEFT,    /* pivot left  for TURN_DURATION_MS           */
-        S_POST_TURN,    /* straight burst to clear junction           */
-        S_REALIGN,      /* single-wall P-only follow after turn       */
-        S_SENSOR_WAIT   /* wait between sensor reads (non-blocking)   */
+        S_STRAIGHT = 0,
+        S_APPROACH,
+        S_TURN_RIGHT,
+        S_TURN_LEFT,
+        S_POST_TURN,
+        S_REALIGN
     } state_t;
 
-    state_t state = S_STRAIGHT;
-
+    state_t  state              = S_STRAIGHT;
     uint32_t turn_start_ms      = 0u;
     uint32_t approach_start_ms  = 0u;
     uint32_t post_turn_start_ms = 0u;
-    uint8_t  last_turn_right    = 0u; /* 1 = last turn was right, 0 = left */
+    uint8_t  last_turn_right    = 0u;
 
-    /* IR debounce: time-based instead of count-based */
-    uint32_t ir_last_change_ms = 0u; /* timestamp of last IR change */
-    uint8_t ir_last_left = 1u;       /* previous IR left reading */
-    uint8_t ir_last_right = 1u;      /* previous IR right reading */
+    uint32_t ir_last_change_ms  = 0u;
+    uint8_t  ir_last_left       = 1u;
+    uint8_t  ir_last_right      = 1u;
 
-    /* Front sensor: track last valid reading when not timeout */
-    uint16_t last_valid_front = 30u;
-
-    /**
-     * @brief  Grace period — skip IR checking for first N iterations.
-     * Increased to 10 so sensors have time to stabilise after power-on.
-     */
-    uint8_t grace = 10u;
+    uint16_t last_valid_front   = 30u;
+    uint8_t  grace              = 10u;
 
     while (1) {
         /* ================================================================
-         * TURNING STATE — bypass wall PID entirely
-         *
-         * Exit when the robot has actually turned into the new corridor:
-         *   1. Front sensor clears  (df > FRONT_SLOW_CM)  — primary condition
-         *   2. Both IR sensors see walls again             — aligned with corridor
-         *   3. Timeout (TURN_DURATION_MS)                 — safety fallback
-         * A minimum guard of 200 ms stops the exit firing before the
-         * pivot has had a chance to physically start.
+         * TURNING — bypass PID entirely while pivoting
+         * Exit condition: both IR see walls AND front clear, OR timeout.
+         * Minimum 500ms guard prevents premature exit at junction entry.
          * ================================================================ */
-        if (state == S_TURN_RIGHT || state == S_TURN_LEFT)
-        {
+        if (state == S_TURN_RIGHT || state == S_TURN_LEFT) {
             if (state == S_TURN_RIGHT)
                 Motor_TurnRight(SPEED_TURN_OUTER, SPEED_TURN_INNER);
             else
-                Motor_TurnLeft(SPEED_TURN_INNER, SPEED_TURN_OUTER);
+                Motor_TurnLeft(SPEED_TURN_L_INNER, SPEED_TURN_OUTER);
 
             uint32_t elapsed = timer_get_ms() - turn_start_ms;
+            if (elapsed >= 500u) {
+                uint16_t df_t      = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
+                if (df_t == 0u) df_t = 255u;
+                uint8_t  ir_l_t    = ir_left_wall();
+                uint8_t  ir_r_t    = ir_right_wall();
+                uint8_t  front_clear = (df_t  > FRONT_SLOW_CM);
+                uint8_t  ir_aligned  = (ir_l_t && ir_r_t);
+                uint8_t  timed_out   = (elapsed >= TURN_DURATION_MS);
 
-            if (elapsed >= 200u)
-            {
-                uint16_t df_t  = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-                if (df_t == 0u) df_t = 255u;          /* timeout → treat as far */
-
-                uint8_t ir_l_t = ir_left_wall();
-                uint8_t ir_r_t = ir_right_wall();
-
-                uint8_t front_clear = (df_t  > FRONT_SLOW_CM);
-                uint8_t ir_aligned  = (ir_l_t && ir_r_t);
-                uint8_t timed_out   = (elapsed >= TURN_DURATION_MS);
-
-                if ((front_clear && ir_aligned) || timed_out)
-                {
+                if ((front_clear && ir_aligned) || timed_out) {
                     if      (ir_aligned && front_clear) UART_SendString("Turn done (IR+front)\r\n");
                     else if (ir_aligned)                UART_SendString("Turn done (IR)\r\n");
                     else if (front_clear)               UART_SendString("Turn done (front)\r\n");
@@ -569,20 +390,16 @@ int main(void) {
         }
 
         /* ================================================================
-         * POST-TURN — straight burst to clear junction geometry
+         * POST-TURN — short straight burst to clear junction geometry
          * ================================================================ */
         if (state == S_POST_TURN) {
-            Motor_Forward((uint8_t)BASE_SPEED,
-                          (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
-
+            Motor_Forward((uint8_t)BASE_SPEED, (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
             if ((timer_get_ms() - turn_start_ms) >= POST_TURN_MS) {
-                /* Flush stale sensor values so jump filter accepts new ones */
                 last_valid_front = 100u;
                 last_good_l      = 20u;
                 last_good_r      = 20u;
                 sensor_valid     = 0u;
                 prev_time        = timer_get_ms();
-
                 state            = S_REALIGN;
                 turn_start_ms    = timer_get_ms();
                 UART_SendString("Realign\r\n");
@@ -592,16 +409,12 @@ int main(void) {
 
         /* ================================================================
          * REALIGN — single-wall P-only follow for POST_TURN_REALIGN_MS.
-         * After right turn → new wall is on the LEFT  (follow dl).
-         * After left  turn → new wall is on the RIGHT (follow dr).
-         * Uses a simple proportional correction so the robot settles
-         * against the near wall before full dual-wall PID re-engages.
+         * After right turn → near wall on LEFT  → follow dl.
+         * After left  turn → near wall on RIGHT → follow dr.
          * ================================================================ */
         if (state == S_REALIGN) {
-            uint16_t dl_r = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
-            uint16_t dr_r = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
-
-            /* Accept any valid reading (sensor_valid=0 bypasses jump filter) */
+            uint16_t dl_r = us_read_once(US_LEFT_TRIG, US_LEFT_ECHO);
+            uint16_t dr_r = us_read_once(US_RIGHT_TRIG, US_RIGHT_ECHO);
             if (dl_r >= US_MIN_CM && dl_r <= US_MAX_CM) last_good_l = dl_r;
             if (dr_r >= US_MIN_CM && dr_r <= US_MAX_CM) last_good_r = dr_r;
 
@@ -611,9 +424,6 @@ int main(void) {
             float r_corr = REALIGN_KP * r_err;
             if (r_corr >  REALIGN_MAX_OUT) r_corr =  REALIGN_MAX_OUT;
             if (r_corr < -REALIGN_MAX_OUT) r_corr = -REALIGN_MAX_OUT;
-
-            /* last_turn_right: near wall on LEFT → positive error steers left
-             * last_turn_left:  near wall on RIGHT → invert sign */
             if (!last_turn_right) r_corr = -r_corr;
 
             int16_t ls_r = (int16_t)REALIGN_SPEED + (int16_t)r_corr;
@@ -623,16 +433,12 @@ int main(void) {
             Motor_Forward((uint8_t)ls_r, (uint8_t)rs_r);
 
             if ((timer_get_ms() - turn_start_ms) >= POST_TURN_REALIGN_MS) {
-                /* Now hand off to full dual-wall PID */
-                wall_integral = 0.0f; wall_prev_error = 0.0f;
-                wall_deriv_filtered = 0.0f;
-                enc_integral  = 0.0f; enc_prev_error  = 0.0f;
+                wall_integral    = 0.0f;
+                wall_prev_error  = 0.0f;
                 enc_reset();
-
-                ir_last_change_ms = timer_get_ms();
-                ir_last_left      = 1u;
-                ir_last_right     = 1u;
-
+                ir_last_change_ms  = timer_get_ms();
+                ir_last_left       = 1u;
+                ir_last_right      = 1u;
                 sensor_valid       = 1u;
                 prev_time          = timer_get_ms();
                 state              = S_STRAIGHT;
@@ -643,270 +449,177 @@ int main(void) {
         }
 
         /* ================================================================
-         * Sensor reads - NON-BLOCKING with delay between sensors
+         * Sensor reads
          * ================================================================ */
-        uint16_t dl_raw = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
-        uint16_t dr_raw = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+        uint16_t dl_raw = us_read_once(US_LEFT_TRIG, US_LEFT_ECHO);
+        uint16_t dr_raw = us_read_once(US_RIGHT_TRIG, US_RIGHT_ECHO);
         uint16_t df_raw = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-        if (df_raw == 0u)
-            df_raw = 255u;
+        if (df_raw == 0u) df_raw = 255u;
 
-        /* FIX 4: track last valid front reading (ignore 255 = timeout) */
-        if (df_raw != 255u) {
-            last_valid_front = df_raw;
-        }
-        uint16_t df = last_valid_front; /* use validated reading for logic */
+        if (df_raw != 255u) last_valid_front = df_raw;
+        uint16_t df = last_valid_front;
 
-        /* @brief  apply jump filter — reject spikes > JUMP_LIMIT cm */
+        /* Jump filter — reject side-sensor spikes > JUMP_LIMIT cm */
         uint16_t dl = last_good_l;
         uint16_t dr = last_good_r;
-
         if (dl_raw >= US_MIN_CM && dl_raw <= US_MAX_CM) {
             uint16_t jump = (dl_raw > last_good_l) ? (dl_raw - last_good_l)
                                                    : (last_good_l - dl_raw);
-            if (jump <= JUMP_LIMIT || sensor_valid == 0u) {
-                last_good_l = dl_raw;
-                dl = dl_raw;
-            }
+            if (jump <= JUMP_LIMIT || sensor_valid == 0u) { last_good_l = dl_raw; dl = dl_raw; }
         }
         if (dr_raw >= US_MIN_CM && dr_raw <= US_MAX_CM) {
             uint16_t jump = (dr_raw > last_good_r) ? (dr_raw - last_good_r)
                                                    : (last_good_r - dr_raw);
-            if (jump <= JUMP_LIMIT || sensor_valid == 0u) {
-                last_good_r = dr_raw;
-                dr = dr_raw;
-            }
+            if (jump <= JUMP_LIMIT || sensor_valid == 0u) { last_good_r = dr_raw; dr = dr_raw; }
         }
-        if (last_good_l > 0u && last_good_r > 0u)
-            sensor_valid = 1u;
+        if (last_good_l > 0u && last_good_r > 0u) sensor_valid = 1u;
 
-        /* ── dt ──────────────────────────────────────────────────────── */
         uint32_t now = timer_get_ms();
         float dt = (float)(now - prev_time) * 0.001f;
-        if (dt < 0.005f)
-            dt = 0.005f;
+        if (dt < 0.005f) dt = 0.005f;
         prev_time = now;
 
-        /* ── Encoder snapshot ───────────────────────────────────────── */
-        int32_t el, er;
-        enc_snapshot(&el, &er);
-        enc_reset();
-
-        /* ── Grace period — don't trust IR at boot ───────────────────── */
         if (grace > 0u) {
             grace--;
-            Motor_Forward((uint8_t)BASE_SPEED,
-                          (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
+            Motor_Forward((uint8_t)BASE_SPEED, (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
             continue;
         }
 
-        /* ================================================================
-         * Log sensor data
-         * ================================================================ */
-        uint8_t ir_left_val = ir_left_wall();
+        uint8_t ir_left_val  = ir_left_wall();
         uint8_t ir_right_val = ir_right_wall();
 
         /* ================================================================
-         * STOP — all five sensors see open space:
-         *   • Both IR sensors open (no wall at front corners)
-         *   • Front US clear (df > FRONT_SLOW_CM, not a timeout)
-         *   • Left  side US beyond range (dl_raw == 0 or > US_MAX_CM)
-         *   • Right side US beyond range (dr_raw == 0 or > US_MAX_CM)
-         * Permanent halt; reset the board to restart.
+         * STOP — open space on all sides → send report and halt
          * ================================================================ */
         uint8_t side_l_open = (dl_raw == 0u || dl_raw > US_MAX_CM);
         uint8_t side_r_open = (dr_raw == 0u || dr_raw > US_MAX_CM);
-
-        if ((!ir_left_wall()) && (!ir_right_wall())
+        if (!ir_left_val && !ir_right_val
             && (df > FRONT_SLOW_CM) && (df < 255u)
             && side_l_open && side_r_open)
         {
             Motor_Stop();
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                            "STOP", "ALL_OPEN");
+            send_turn_report();
             UART_SendString("STOP: open space\r\n");
-            while (1);  /* halt — reset board to restart */
+            while (1);
         }
 
         /* ================================================================
-         * Post-turn settling: ignore FRONT_CLOSE for 300ms after turn
-         * FIX 2: Raise threshold temporarily to prevent premature re-entry
+         * Post-turn settling: suppress FRONT_CLOSE for 500ms after turn
          * ================================================================ */
-        uint32_t settle_elapsed = timer_get_ms() - post_turn_start_ms;
-        uint8_t front_close_threshold =
-            (settle_elapsed < 500u) ? 12u : FRONT_SLOW_CM;
+        uint32_t settle_elapsed     = timer_get_ms() - post_turn_start_ms;
+        uint8_t  front_close_thresh = (settle_elapsed < 500u) ? 12u : FRONT_SLOW_CM;
 
         /* ================================================================
-         * APPROACH detection — front wall close (with settling protection)
+         * APPROACH
          * ================================================================ */
-        if (state == S_STRAIGHT && df <= front_close_threshold) {
-            state = S_APPROACH;
+        if (state == S_STRAIGHT && df <= front_close_thresh) {
+            state             = S_APPROACH;
             approach_start_ms = timer_get_ms();
             ir_last_change_ms = timer_get_ms();
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH",
-                            "FRONT_CLOSE");
             UART_SendString("Approach\r\n");
         }
 
         /* ================================================================
-         * IR DEBOUNCE TURN DETECTION (TIME-BASED)
-         *
-         * FIX 3: IR must read the SAME value for >= 120ms continuously.
-         * Timestamp records when IR last changed state.
-         * Only act on IR reading if (current_time - ir_stable_since) >= 120ms.
+         * IR DEBOUNCE TURN DETECTION
+         * Only fires when exactly one side is open for >= 200ms.
          * ================================================================ */
         if (state == S_APPROACH) {
             uint32_t approach_elapsed = timer_get_ms() - approach_start_ms;
-            uint32_t ir_stable_time = timer_get_ms() - ir_last_change_ms;
+            uint32_t ir_stable_time   = timer_get_ms() - ir_last_change_ms;
 
-            /* -- Check if IR state changed -------------------------------- */
-            uint8_t ir_left_now = ir_left_wall();
+            uint8_t ir_left_now  = ir_left_wall();
             uint8_t ir_right_now = ir_right_wall();
 
-            if ((ir_left_now != ir_last_left) ||
-                (ir_right_now != ir_last_right)) {
-                ir_last_left = ir_left_now;
-                ir_last_right = ir_right_now;
+            if ((ir_left_now != ir_last_left) || (ir_right_now != ir_last_right)) {
+                ir_last_left      = ir_left_now;
+                ir_last_right     = ir_right_now;
                 ir_last_change_ms = timer_get_ms();
-                ir_stable_time = 0u;
+                ir_stable_time    = 0u;
             }
 
-            /* -- Fire turn only if IR stable for >= IR_DEBOUNCE_MS (120ms) --
-             */
-            if (ir_stable_time >= 120u) {
-                /* Right IR open → turn LEFT (sensors are mirror-reversed) */
-                if (ir_right_now == 0u) {
+            if (ir_stable_time >= 80u) {
+                uint8_t l_open = (ir_left_now  == 0u);
+                uint8_t r_open = (ir_right_now == 0u);
+
+                if (r_open && !l_open) {
+                    if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'L';
                     state           = S_TURN_LEFT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 0u;
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_LEFT", "IR_RIGHT_OPEN");
                     UART_SendString("Turn L\r\n");
                     continue;
                 }
-
-                /* Left IR open → turn RIGHT (sensors are mirror-reversed) */
-                if (ir_left_now == 0u) {
+                if (l_open && !r_open) {
+                    if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'R';
                     state           = S_TURN_RIGHT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 1u;
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_RIGHT", "IR_LEFT_OPEN");
                     UART_SendString("Turn R\r\n");
                     continue;
                 }
             }
 
-            /* -- FIX 1: Safety timeout for stuck in APPROACH (2500ms) ----- */
+            /* Safety timeout (2500ms) — force turn based on current IR */
             if (approach_elapsed > 2500u) {
-                uint8_t ir_left_now_check = ir_left_wall();
-                uint8_t ir_right_now_check = ir_right_wall();
+                uint8_t ir_l_chk = ir_left_wall();
+                uint8_t ir_r_chk = ir_right_wall();
 
-                if (ir_right_now_check == 0u) {
+                if (ir_r_chk == 0u) {
+                    if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'L';
                     state             = S_TURN_LEFT;
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 0u;
                     ir_last_change_ms = timer_get_ms();
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_LEFT", "TIMEOUT_IR_RIGHT");
                     UART_SendString("TIMEOUT Turn L\r\n");
                     continue;
-                } else if (ir_left_now_check == 0u) {
+                } else if (ir_l_chk == 0u) {
+                    if (turn_count < MAX_TURNS) turn_sequence[turn_count++] = 'R';
                     state             = S_TURN_RIGHT;
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 1u;
                     ir_last_change_ms = timer_get_ms();
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_RIGHT", "TIMEOUT_IR_LEFT");
                     UART_SendString("TIMEOUT Turn R\r\n");
                     continue;
                 } else {
-                    /* FIX 1: Both walls present - BACKUP instead of STOP */
-                    Motor_Forward(50u, 50u); /* reverse at low speed */
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "BACKUP", "BOTH_WALLS_TIMEOUT");
+                    /* Both walls still present — creep forward slowly */
+                    Motor_Forward(50u, 50u);
                     UART_SendString("TIMEOUT BACKUP\r\n");
-                    state = S_APPROACH; /* stay in APPROACH, reset timer */
+                    state             = S_APPROACH;
                     approach_start_ms = timer_get_ms();
                     continue;
                 }
             }
-
-            /* @brief  both walls still present — keep creeping forward slowly
-             */
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH",
-                            "WAIT_IR");
         }
 
         /* ================================================================
-         * PID — wall centering + encoder straight-line
+         * Wall PID
          * ================================================================ */
         float raw_err = 0.0f;
-        float w_corr = 0.0f;
-        float e_corr = 0.0f;
-
+        float w_corr  = 0.0f;
         if (sensor_valid) {
             w_corr = wall_pid((float)dl, (float)dr, dt, &raw_err);
-            float abs_err = raw_err < 0.0f ? -raw_err : raw_err;
-            if (abs_err <= WALL_DEADBAND) {
-                e_corr = enc_pid(el, er, dt);
-            } else {
-                /* @brief  wall error is large — reset encoder PID to avoid
-                 * conflict */
-                enc_integral = 0.0f;
-                enc_prev_error = 0.0f;
-            }
-        }
-
-        /* ================================================================
-         * Log wall-following state
-         * ================================================================ */
-        if (state == S_STRAIGHT) {
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "STRAIGHT",
-                            "PID_FOLLOW");
         }
 
         /* ================================================================
          * Drive
          * ================================================================ */
-        float total = w_corr + e_corr;
         uint8_t base = (state == S_APPROACH) ? SPEED_SLOW : (uint8_t)BASE_SPEED;
-
-        int16_t ls = (int16_t)base + (int16_t)total;
-        int16_t rs = (int16_t)(base - RIGHT_REDUCE) - (int16_t)total;
+        int16_t ls = (int16_t)base + (int16_t)w_corr;
+        int16_t rs = (int16_t)(base - RIGHT_REDUCE) - (int16_t)w_corr;
         ls = clamp16(ls, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
         rs = clamp16(rs, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
         Motor_Forward((uint8_t)ls, (uint8_t)rs);
 
         /* ================================================================
-         * Debug output
+         * Debug UART — minimal fields to keep loop fast at 9600 baud
          * ================================================================ */
-        UART_SendString("L=");
-        uart_print_i16((int16_t)dl);
-        UART_SendString(" R=");
-        uart_print_i16((int16_t)dr);
-        UART_SendString(" F=");
-        uart_print_i16((int16_t)df);
-        UART_SendString(" e=");
-        uart_print_i16((int16_t)raw_err);
-        UART_SendString(" W=");
-        uart_print_i16((int16_t)w_corr);
-        UART_SendString(" EL=");
-        uart_print_i32(el);
-        UART_SendString(" ER=");
-        uart_print_i32(er);
-        UART_SendString(" E=");
-        uart_print_i16((int16_t)e_corr);
-        UART_SendString(" LS=");
-        uart_print_i16(ls);
-        UART_SendString(" RS=");
-        uart_print_i16(rs);
-        UART_SendString(" IRL=");
-        uart_print_i16((int16_t)ir_left_wall());
-        UART_SendString(" IRR=");
-        uart_print_i16((int16_t)ir_right_wall());
-        UART_SendString(" ST=");
-        uart_print_i16((int16_t)state);
+        UART_SendString("L=");  uart_print_i16((int16_t)dl);
+        UART_SendString(" R="); uart_print_i16((int16_t)dr);
+        UART_SendString(" e="); uart_print_i16((int16_t)raw_err);
+        UART_SendString(" W="); uart_print_i16((int16_t)w_corr);
+        UART_SendString(" F="); uart_print_i16((int16_t)df);
+        UART_SendString(" S="); uart_print_i16((int16_t)state);
+        UART_SendString(" T="); uart_print_u16(turn_count);
         UART_SendString("\r\n");
     }
 
