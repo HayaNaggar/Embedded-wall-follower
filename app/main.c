@@ -114,13 +114,24 @@ static inline uint8_t ir_right_wall(void) {
 /* =========================================================================
  * Wall PID gains
  * ========================================================================= */
-#define WALL_KP 1.2f
-#define WALL_KI 0.04f
-#define WALL_KD 0.3f
-#define WALL_MAX_OUT 35.0f
-#define WALL_INTEGRAL_LIM 25.0f
-#define WALL_DEADBAND 1.5f
-#define WALL_DERIV_FILTER 0.55f
+#define WALL_KP 3.0f
+#define WALL_KI 0.08f
+#define WALL_KD 0.6f
+#define WALL_MAX_OUT 70.0f
+#define WALL_INTEGRAL_LIM 30.0f
+#define WALL_DEADBAND 0.5f
+#define WALL_DERIV_FILTER 0.3f
+
+/* =========================================================================
+ * Post-turn single-wall realignment
+ * After a right turn → follow left wall at REALIGN_TARGET_CM.
+ * After a left  turn → follow right wall at REALIGN_TARGET_CM.
+ * ========================================================================= */
+#define POST_TURN_REALIGN_MS   600u   /* duration of single-wall follow phase */
+#define REALIGN_TARGET_CM      12.5f  /* desired distance from the near wall   */
+#define REALIGN_KP             4.0f   /* P-only, error = wall_dist - target    */
+#define REALIGN_MAX_OUT        60.0f
+#define REALIGN_SPEED          180u   /* base speed during realign             */
 
 /* =========================================================================
  * Encoder PID gains
@@ -485,6 +496,7 @@ int main(void) {
         S_TURN_RIGHT,   /* pivot right for TURN_DURATION_MS           */
         S_TURN_LEFT,    /* pivot left  for TURN_DURATION_MS           */
         S_POST_TURN,    /* straight burst to clear junction           */
+        S_REALIGN,      /* single-wall P-only follow after turn       */
         S_SENSOR_WAIT   /* wait between sensor reads (non-blocking)   */
     } state_t;
 
@@ -493,6 +505,7 @@ int main(void) {
     uint32_t turn_start_ms      = 0u;
     uint32_t approach_start_ms  = 0u;
     uint32_t post_turn_start_ms = 0u;
+    uint8_t  last_turn_right    = 0u; /* 1 = last turn was right, 0 = left */
 
     /* IR debounce: time-based instead of count-based */
     uint32_t ir_last_change_ms = 0u; /* timestamp of last IR change */
@@ -540,7 +553,7 @@ int main(void) {
                 uint8_t ir_aligned  = (ir_l_t && ir_r_t);
                 uint8_t timed_out   = (elapsed >= TURN_DURATION_MS);
 
-                if (front_clear && ir_aligned )
+                if ((front_clear && ir_aligned) || timed_out)
                 {
                     if      (ir_aligned && front_clear) UART_SendString("Turn done (IR+front)\r\n");
                     else if (ir_aligned)                UART_SendString("Turn done (IR)\r\n");
@@ -556,35 +569,71 @@ int main(void) {
         }
 
         /* ================================================================
-         * POST-TURN — drive straight to clear junction
+         * POST-TURN — straight burst to clear junction geometry
          * ================================================================ */
         if (state == S_POST_TURN) {
             Motor_Forward((uint8_t)BASE_SPEED,
                           (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
 
             if ((timer_get_ms() - turn_start_ms) >= POST_TURN_MS) {
-                /* Reset PID integrators */
+                /* Flush stale sensor values so jump filter accepts new ones */
+                last_valid_front = 100u;
+                last_good_l      = 20u;
+                last_good_r      = 20u;
+                sensor_valid     = 0u;
+                prev_time        = timer_get_ms();
+
+                state            = S_REALIGN;
+                turn_start_ms    = timer_get_ms();
+                UART_SendString("Realign\r\n");
+            }
+            continue;
+        }
+
+        /* ================================================================
+         * REALIGN — single-wall P-only follow for POST_TURN_REALIGN_MS.
+         * After right turn → new wall is on the LEFT  (follow dl).
+         * After left  turn → new wall is on the RIGHT (follow dr).
+         * Uses a simple proportional correction so the robot settles
+         * against the near wall before full dual-wall PID re-engages.
+         * ================================================================ */
+        if (state == S_REALIGN) {
+            uint16_t dl_r = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
+            uint16_t dr_r = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+
+            /* Accept any valid reading (sensor_valid=0 bypasses jump filter) */
+            if (dl_r >= US_MIN_CM && dl_r <= US_MAX_CM) last_good_l = dl_r;
+            if (dr_r >= US_MIN_CM && dr_r <= US_MAX_CM) last_good_r = dr_r;
+
+            float wall_dist = last_turn_right ? (float)last_good_l
+                                              : (float)last_good_r;
+            float r_err  = wall_dist - REALIGN_TARGET_CM;
+            float r_corr = REALIGN_KP * r_err;
+            if (r_corr >  REALIGN_MAX_OUT) r_corr =  REALIGN_MAX_OUT;
+            if (r_corr < -REALIGN_MAX_OUT) r_corr = -REALIGN_MAX_OUT;
+
+            /* last_turn_right: near wall on LEFT → positive error steers left
+             * last_turn_left:  near wall on RIGHT → invert sign */
+            if (!last_turn_right) r_corr = -r_corr;
+
+            int16_t ls_r = (int16_t)REALIGN_SPEED + (int16_t)r_corr;
+            int16_t rs_r = (int16_t)REALIGN_SPEED - (int16_t)r_corr;
+            ls_r = clamp16(ls_r, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
+            rs_r = clamp16(rs_r, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
+            Motor_Forward((uint8_t)ls_r, (uint8_t)rs_r);
+
+            if ((timer_get_ms() - turn_start_ms) >= POST_TURN_REALIGN_MS) {
+                /* Now hand off to full dual-wall PID */
                 wall_integral = 0.0f; wall_prev_error = 0.0f;
                 wall_deriv_filtered = 0.0f;
                 enc_integral  = 0.0f; enc_prev_error  = 0.0f;
                 enc_reset();
 
-                /* Reset IR debounce */
                 ir_last_change_ms = timer_get_ms();
                 ir_last_left      = 1u;
                 ir_last_right     = 1u;
 
-                /* Flush stale pre-turn sensor values.
-                 * Without this the jump filter keeps the old side readings
-                 * and last_valid_front could immediately re-trigger APPROACH. */
-                last_valid_front = 100u;
-                last_good_l      = 20u;
-                last_good_r      = 20u;
-                sensor_valid     = 0u;  /* bypass jump filter for first reads */
-
-                /* Reset prev_time so the first PID call gets a sane dt.
-                 * Without this, dt = time_since_turn_started (~1 s),
-                 * which spikes the integral on the very first PID tick. */
+                sensor_valid       = 1u;
                 prev_time          = timer_get_ms();
                 state              = S_STRAIGHT;
                 post_turn_start_ms = timer_get_ms();
@@ -727,8 +776,9 @@ int main(void) {
             if (ir_stable_time >= 120u) {
                 /* Right IR open → turn LEFT (sensors are mirror-reversed) */
                 if (ir_right_now == 0u) {
-                    state         = S_TURN_LEFT;
-                    turn_start_ms = timer_get_ms();
+                    state           = S_TURN_LEFT;
+                    turn_start_ms   = timer_get_ms();
+                    last_turn_right = 0u;
                     log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
                                     "TURN_LEFT", "IR_RIGHT_OPEN");
                     UART_SendString("Turn L\r\n");
@@ -737,8 +787,9 @@ int main(void) {
 
                 /* Left IR open → turn RIGHT (sensors are mirror-reversed) */
                 if (ir_left_now == 0u) {
-                    state         = S_TURN_RIGHT;
-                    turn_start_ms = timer_get_ms();
+                    state           = S_TURN_RIGHT;
+                    turn_start_ms   = timer_get_ms();
+                    last_turn_right = 1u;
                     log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
                                     "TURN_RIGHT", "IR_LEFT_OPEN");
                     UART_SendString("Turn R\r\n");
@@ -754,6 +805,7 @@ int main(void) {
                 if (ir_right_now_check == 0u) {
                     state             = S_TURN_LEFT;
                     turn_start_ms     = timer_get_ms();
+                    last_turn_right   = 0u;
                     ir_last_change_ms = timer_get_ms();
                     log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
                                     "TURN_LEFT", "TIMEOUT_IR_RIGHT");
@@ -762,6 +814,7 @@ int main(void) {
                 } else if (ir_left_now_check == 0u) {
                     state             = S_TURN_RIGHT;
                     turn_start_ms     = timer_get_ms();
+                    last_turn_right   = 1u;
                     ir_last_change_ms = timer_get_ms();
                     log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
                                     "TURN_RIGHT", "TIMEOUT_IR_LEFT");
