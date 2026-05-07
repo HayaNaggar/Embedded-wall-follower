@@ -83,12 +83,13 @@ static inline uint8_t ir_right_wall(void) {
 /* =========================================================================
  * Turn parameters
  * ========================================================================= */
-#define SPEED_SLOW 110u       /* increased - don't hesitate so much */
-#define SPEED_TURN_OUTER 180u /* reduced from 210 - turns less sharp */
-#define SPEED_TURN_INNER 70u  /* increased from 25 - more balanced */
+#define SPEED_SLOW        180u
+#define SPEED_TURN_OUTER  220u   /* outer wheel forward speed  */
+#define SPEED_TURN_INNER  110u   /* inner wheel backward speed */
 
-/** @brief  Fixed time for a 90° turn in milliseconds. Tune for your robot. */
-#define TURN_DURATION_MS 900u /* increased to 900ms for full 90° turn */
+/* Sensor-based exit now fires first; this is the safety timeout only.
+ * 900 ms is a generous upper bound for a full 90° pivot. */
+#define TURN_DURATION_MS  900u
 
 /** @brief  Straight burst after a turn to clear junction geometry (ms). */
 #define POST_TURN_MS 250u
@@ -104,9 +105,9 @@ static inline uint8_t ir_right_wall(void) {
 /* =========================================================================
  * Drive parameters
  * ========================================================================= */
-#define BASE_SPEED 150u
-#define MAX_SPEED 210u
-#define MIN_SPEED 60u
+#define BASE_SPEED 230u
+#define MAX_SPEED  255u
+#define MIN_SPEED   80u
 #define LEFT_TRIM 0
 #define RIGHT_REDUCE 0
 
@@ -510,19 +511,46 @@ int main(void) {
     while (1) {
         /* ================================================================
          * TURNING STATE — bypass wall PID entirely
+         *
+         * Exit when the robot has actually turned into the new corridor:
+         *   1. Front sensor clears  (df > FRONT_SLOW_CM)  — primary condition
+         *   2. Both IR sensors see walls again             — aligned with corridor
+         *   3. Timeout (TURN_DURATION_MS)                 — safety fallback
+         * A minimum guard of 200 ms stops the exit firing before the
+         * pivot has had a chance to physically start.
          * ================================================================ */
-        if (state == S_TURN_RIGHT || state == S_TURN_LEFT) {
+        if (state == S_TURN_RIGHT || state == S_TURN_LEFT)
+        {
             if (state == S_TURN_RIGHT)
                 Motor_TurnRight(SPEED_TURN_OUTER, SPEED_TURN_INNER);
             else
                 Motor_TurnLeft(SPEED_TURN_INNER, SPEED_TURN_OUTER);
 
-            /* @brief  exit turn after fixed time — no IR dependency */
-            if ((timer_get_ms() - turn_start_ms) >= TURN_DURATION_MS) {
-                UART_SendString("Turn done\r\n");
-                state = S_POST_TURN;
-                turn_start_ms = timer_get_ms(); /* reuse for post-turn */
-                enc_reset();
+            uint32_t elapsed = timer_get_ms() - turn_start_ms;
+
+            if (elapsed >= 200u)
+            {
+                uint16_t df_t  = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
+                if (df_t == 0u) df_t = 255u;          /* timeout → treat as far */
+
+                uint8_t ir_l_t = ir_left_wall();
+                uint8_t ir_r_t = ir_right_wall();
+
+                uint8_t front_clear = (df_t  > FRONT_SLOW_CM);
+                uint8_t ir_aligned  = (ir_l_t && ir_r_t);
+                uint8_t timed_out   = (elapsed >= TURN_DURATION_MS);
+
+                if (front_clear && ir_aligned )
+                {
+                    if      (ir_aligned && front_clear) UART_SendString("Turn done (IR+front)\r\n");
+                    else if (ir_aligned)                UART_SendString("Turn done (IR)\r\n");
+                    else if (front_clear)               UART_SendString("Turn done (front)\r\n");
+                    else                                UART_SendString("Turn done (timeout)\r\n");
+
+                    state         = S_POST_TURN;
+                    turn_start_ms = timer_get_ms();
+                    enc_reset();
+                }
             }
             continue;
         }
@@ -535,19 +563,29 @@ int main(void) {
                           (uint8_t)(BASE_SPEED - RIGHT_REDUCE));
 
             if ((timer_get_ms() - turn_start_ms) >= POST_TURN_MS) {
-                /* @brief  reset all PID state so stale integrals don't jerk */
-                wall_integral = 0.0f;
-                wall_prev_error = 0.0f;
+                /* Reset PID integrators */
+                wall_integral = 0.0f; wall_prev_error = 0.0f;
                 wall_deriv_filtered = 0.0f;
-                enc_integral = 0.0f;
-                enc_prev_error = 0.0f;
+                enc_integral  = 0.0f; enc_prev_error  = 0.0f;
                 enc_reset();
 
-                /* @brief  also reset IR debounce state */
+                /* Reset IR debounce */
                 ir_last_change_ms = timer_get_ms();
-                ir_last_left = 1u;
-                ir_last_right = 1u;
+                ir_last_left      = 1u;
+                ir_last_right     = 1u;
 
+                /* Flush stale pre-turn sensor values.
+                 * Without this the jump filter keeps the old side readings
+                 * and last_valid_front could immediately re-trigger APPROACH. */
+                last_valid_front = 100u;
+                last_good_l      = 20u;
+                last_good_r      = 20u;
+                sensor_valid     = 0u;  /* bypass jump filter for first reads */
+
+                /* Reset prev_time so the first PID call gets a sane dt.
+                 * Without this, dt = time_since_turn_started (~1 s),
+                 * which spikes the integral on the very first PID tick. */
+                prev_time          = timer_get_ms();
                 state              = S_STRAIGHT;
                 post_turn_start_ms = timer_get_ms();
                 UART_SendString("Resuming wall-follow\r\n");
@@ -620,20 +658,25 @@ int main(void) {
         uint8_t ir_right_val = ir_right_wall();
 
         /* ================================================================
-         * ALL OPEN — stop condition
-         * Front timeout (255) should NOT count as open space; use validated df
+         * STOP — all five sensors see open space:
+         *   • Both IR sensors open (no wall at front corners)
+         *   • Front US clear (df > FRONT_SLOW_CM, not a timeout)
+         *   • Left  side US beyond range (dl_raw == 0 or > US_MAX_CM)
+         *   • Right side US beyond range (dr_raw == 0 or > US_MAX_CM)
+         * Permanent halt; reset the board to restart.
          * ================================================================ */
-        uint8_t left_open = (dl == 0u) || (dl > US_MAX_CM);
-        uint8_t right_open = (dr == 0u) || (dr > US_MAX_CM);
-        uint8_t front_valid_open = (df > FRONT_SLOW_CM) && (df < 255u);
-        uint8_t ir_both_open = (!ir_left_wall()) && (!ir_right_wall());
+        uint8_t side_l_open = (dl_raw == 0u || dl_raw > US_MAX_CM);
+        uint8_t side_r_open = (dr_raw == 0u || dr_raw > US_MAX_CM);
 
-        if (left_open && right_open && front_valid_open && ir_both_open) {
-            Motor_Forward(0u, 0u);
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "STOP",
-                            "ALL_OPEN");
-            UART_SendString("ALL OPEN - STOP\r\n");
-            continue;
+        if ((!ir_left_wall()) && (!ir_right_wall())
+            && (df > FRONT_SLOW_CM) && (df < 255u)
+            && side_l_open && side_r_open)
+        {
+            Motor_Stop();
+            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
+                            "STOP", "ALL_OPEN");
+            UART_SendString("STOP: open space\r\n");
+            while (1);  /* halt — reset board to restart */
         }
 
         /* ================================================================

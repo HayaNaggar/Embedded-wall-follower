@@ -48,33 +48,37 @@ void Motor_Forward(uint8_t leftSpeed, uint8_t rightSpeed)
 }
 
 /**
- * @brief Smooth right turn
- * Left motor faster, right motor slower
+ * @brief Pivot right: left motor forward, right motor backward.
+ * leftSpeed  = forward speed of outer (left) motor
+ * rightSpeed = backward speed of inner (right) motor
  */
 void Motor_TurnRight(uint8_t leftSpeed, uint8_t rightSpeed)
 {
-    /* Both motors forward */
-    PORTB |= (1 << PB0);
+    /* Left motor: forward */
+    PORTB |=  (1 << PB0);
     PORTB &= ~(1 << PB1);
 
-    PORTB |= (1 << PB2);
-    PORTB &= ~(1 << PB3);
+    /* Right motor: backward */
+    PORTB &= ~(1 << PB2);
+    PORTB |=  (1 << PB3);
 
     PWM_SetLeftSpeed(leftSpeed);
     PWM_SetRightSpeed(rightSpeed);
 }
 
 /**
- * @brief Smooth left turn
- * Left motor slower, right motor faster
+ * @brief Pivot left: right motor forward, left motor backward.
+ * leftSpeed  = backward speed of inner (left) motor
+ * rightSpeed = forward speed of outer (right) motor
  */
 void Motor_TurnLeft(uint8_t leftSpeed, uint8_t rightSpeed)
 {
-    /* Both motors forward */
-    PORTB |= (1 << PB0);
-    PORTB &= ~(1 << PB1);
+    /* Left motor: backward */
+    PORTB &= ~(1 << PB0);
+    PORTB |=  (1 << PB1);
 
-    PORTB |= (1 << PB2);
+    /* Right motor: forward */
+    PORTB |=  (1 << PB2);
     PORTB &= ~(1 << PB3);
 
     PWM_SetLeftSpeed(leftSpeed);
