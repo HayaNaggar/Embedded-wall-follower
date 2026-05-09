@@ -36,6 +36,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "motor.h"
+#include "Ultrasonic.h"
 
 /* =========================================================================
  * Ultrasonic – LEFT and RIGHT (wall following)
@@ -150,6 +151,13 @@ static volatile int32_t g_enc_right = 0;
 static volatile uint8_t g_prev_pind = 0u;
 static volatile uint8_t g_prev_pinb = 0u;
 
+/* Sensor scheduler — written by scheduler, read by state machine + PID */
+static uint16_t g_dist_left      = 0u;
+static uint16_t g_dist_front     = 0u;
+static uint16_t g_dist_right     = 0u;
+static uint8_t  g_sensor_turn    = 0u;
+static uint32_t g_last_sensor_ms = 0u;
+
 ISR(PCINT2_vect) {
     uint8_t cur = PIND, changed = cur ^ g_prev_pind;
     g_prev_pind = cur;
@@ -193,102 +201,6 @@ static void enc_snapshot(int32_t *l, int32_t *r) {
         *l = g_enc_left;
         *r = g_enc_right;
     }
-}
-
-/* =========================================================================
- * Ultrasonic helpers
- * ========================================================================= */
-
-/** @brief  Init trig pins as output, echo pins as input. */
-static void ultrasonic_init(void)
-{
-    DDRC |=  (1u<<US_LEFT_TRIG)|(1u<<US_RIGHT_TRIG)|(1u<<US_FRONT_TRIG);
-    DDRC &= ~((1u<<US_LEFT_ECHO)|(1u<<US_RIGHT_ECHO)|(1u<<US_FRONT_ECHO));
-    PORTC &= ~((1u<<US_LEFT_TRIG)|(1u<<US_RIGHT_TRIG)|(1u<<US_FRONT_TRIG));
-}
-
-/*
- * Microsecond timestamp: combines the 1ms project counter with TCNT1.
- * Timer1 prescaler=8, F_CPU=16MHz → 2 ticks/us, period=2000 ticks=1ms.
- * Resolution ~0.5 us.  Handles the CTC-reset boundary: if the compare
- * flag is already set but the ISR hasn't run yet, the ms count is
- * adjusted so the result is always monotonic.
- */
-static uint32_t us_now(void)
-{
-    uint32_t ms;
-    uint16_t tc;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        tc = TCNT1;
-        ms = timer_get_ms();
-        /* ISR pending but not yet serviced — ms is one behind */
-        if ((TIFR1 & (1u << OCF1A)) && tc < 4u) ms++;
-    }
-    return ms * 1000UL + (uint32_t)(tc >> 1u);  /* tc/2 converts ticks → us */
-}
-
-/*
- * Send one trigger pulse and measure the echo duration.
- * All timing uses us_now() (project timer + TCNT1) — no _delay_us.
- * Returns distance in cm, or 0 on timeout / out-of-range.
- */
-static uint16_t us_read_once(uint8_t trig, uint8_t echo)
-{
-    /* Wait for any lingering echo to clear (up to 10 ms) */
-    uint32_t t0 = timer_get_ms();
-    while ((PINC & (1u << echo)) && (timer_get_ms() - t0) < 10u)
-        ;
-
-    /* 10 µs trigger pulse measured by us_now() — no _delay_us */
-    PORTC |= (1u << trig);
-    uint32_t t_trig = us_now();
-    while ((us_now() - t_trig) < 10u)
-        ;
-    PORTC &= ~(1u << trig);
-
-    /* Wait for echo HIGH (4 ms timeout) */
-    t0 = timer_get_ms();
-    while (!(PINC & (1u << echo))) {
-        if ((timer_get_ms() - t0) >= 4u) return 0u;
-    }
-
-    /* Measure echo HIGH duration */
-    uint32_t echo_start = us_now();
-    while (PINC & (1u << echo)) {
-        if ((us_now() - echo_start) >= 8000u) return 0u;  /* 8 ms = ~136 cm */
-    }
-    uint32_t duration_us = us_now() - echo_start;
-
-    if (duration_us == 0u) return 0u;
-    return (uint16_t)(duration_us / 58u);
-}
-
-/**
- * @brief  Take 3 readings and return the median — rejects noise spikes.
- */
-static uint16_t us_read_median3(uint8_t trig, uint8_t echo) {
-    uint16_t s[3], tmp;
-    s[0] = us_read_once(trig, echo);
-    s[1] = us_read_once(trig, echo);
-    s[2] = us_read_once(trig, echo);
-
-    /* @brief  bubble sort 3 elements */
-    if (s[0] > s[1]) {
-        tmp = s[0];
-        s[0] = s[1];
-        s[1] = tmp;
-    }
-    if (s[1] > s[2]) {
-        tmp = s[1];
-        s[1] = s[2];
-        s[2] = tmp;
-    }
-    if (s[0] > s[1]) {
-        tmp = s[0];
-        s[0] = s[1];
-        s[1] = tmp;
-    }
-    return s[1];
 }
 
 /* =========================================================================
@@ -458,7 +370,10 @@ int main(void) {
     /* ── Init ─────────────────────────────────────────────────────────── */
     timer_init();
     UART_Init(9600UL);
-    ultrasonic_init();
+    Ultrasonic_Init(
+        (1u<<US_LEFT_TRIG)|(1u<<US_RIGHT_TRIG)|(1u<<US_FRONT_TRIG),
+        (1u<<US_LEFT_ECHO)|(1u<<US_RIGHT_ECHO)|(1u<<US_FRONT_ECHO)
+    );
     encoder_init();
     Motor_Init();
 
@@ -475,8 +390,8 @@ int main(void) {
     uint16_t last_good_r = 15u;
     UART_SendString("Calibrating...\r\n");
     for (uint8_t wi = 0; wi < 5u; wi++) {
-        uint16_t wl = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
-        uint16_t wr = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+        uint16_t wl = Ultrasonic_ReadMedian3(US_LEFT_TRIG, US_LEFT_ECHO);
+        uint16_t wr = Ultrasonic_ReadMedian3(US_RIGHT_TRIG, US_RIGHT_ECHO);
         if (wl >= US_MIN_CM && wl <= US_MAX_CM)
             last_good_l = wl;
         if (wr >= US_MIN_CM && wr <= US_MAX_CM)
@@ -523,6 +438,23 @@ int main(void) {
 
     while (1) {
         /* ================================================================
+         * Sensor scheduler — one sensor every 20ms, rotating
+         * Full cycle = 60ms across 3 sensors (HC-SR04 minimum respected)
+         * ================================================================ */
+        {
+            uint32_t sched_now = timer_get_ms();
+            if (sched_now - g_last_sensor_ms >= 20u) {
+                g_last_sensor_ms = sched_now;
+                switch (g_sensor_turn) {
+                    case 0: g_dist_left  = Ultrasonic_ReadOnce(US_LEFT_TRIG,  US_LEFT_ECHO);  break;
+                    case 1: g_dist_front = Ultrasonic_ReadOnce(US_FRONT_TRIG, US_FRONT_ECHO); break;
+                    case 2: g_dist_right = Ultrasonic_ReadOnce(US_RIGHT_TRIG, US_RIGHT_ECHO); break;
+                }
+                g_sensor_turn = (g_sensor_turn + 1u) % 3u;
+            }
+        }
+
+        /* ================================================================
          * TURNING STATE — bypass wall PID entirely
          *
          * Exit when the robot has actually turned into the new corridor:
@@ -543,8 +475,7 @@ int main(void) {
 
             if (elapsed >= 200u)
             {
-                uint16_t df_t  = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-                if (df_t == 0u) df_t = 255u;          /* timeout → treat as far */
+                uint16_t df_t  = (g_dist_front == 0u) ? 255u : g_dist_front;
 
                 uint8_t ir_l_t = ir_left_wall();
                 uint8_t ir_r_t = ir_right_wall();
@@ -555,11 +486,6 @@ int main(void) {
 
                 if ((front_clear && ir_aligned) || timed_out)
                 {
-                    if      (ir_aligned && front_clear) UART_SendString("Turn done (IR+front)\r\n");
-                    else if (ir_aligned)                UART_SendString("Turn done (IR)\r\n");
-                    else if (front_clear)               UART_SendString("Turn done (front)\r\n");
-                    else                                UART_SendString("Turn done (timeout)\r\n");
-
                     state         = S_POST_TURN;
                     turn_start_ms = timer_get_ms();
                     enc_reset();
@@ -585,7 +511,6 @@ int main(void) {
 
                 state            = S_REALIGN;
                 turn_start_ms    = timer_get_ms();
-                UART_SendString("Realign\r\n");
             }
             continue;
         }
@@ -598,8 +523,8 @@ int main(void) {
          * against the near wall before full dual-wall PID re-engages.
          * ================================================================ */
         if (state == S_REALIGN) {
-            uint16_t dl_r = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
-            uint16_t dr_r = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
+            uint16_t dl_r = g_dist_left;
+            uint16_t dr_r = g_dist_right;
 
             /* Accept any valid reading (sensor_valid=0 bypasses jump filter) */
             if (dl_r >= US_MIN_CM && dl_r <= US_MAX_CM) last_good_l = dl_r;
@@ -637,7 +562,6 @@ int main(void) {
                 prev_time          = timer_get_ms();
                 state              = S_STRAIGHT;
                 post_turn_start_ms = timer_get_ms();
-                UART_SendString("Resuming wall-follow\r\n");
             }
             continue;
         }
@@ -645,11 +569,9 @@ int main(void) {
         /* ================================================================
          * Sensor reads - NON-BLOCKING with delay between sensors
          * ================================================================ */
-        uint16_t dl_raw = us_read_median3(US_LEFT_TRIG, US_LEFT_ECHO);
-        uint16_t dr_raw = us_read_median3(US_RIGHT_TRIG, US_RIGHT_ECHO);
-        uint16_t df_raw = us_read_once(US_FRONT_TRIG, US_FRONT_ECHO);
-        if (df_raw == 0u)
-            df_raw = 255u;
+        uint16_t dl_raw = g_dist_left;
+        uint16_t dr_raw = g_dist_right;
+        uint16_t df_raw = (g_dist_front == 0u) ? 255u : g_dist_front;
 
         /* FIX 4: track last valid front reading (ignore 255 = timeout) */
         if (df_raw != 255u) {
@@ -703,9 +625,6 @@ int main(void) {
         /* ================================================================
          * Log sensor data
          * ================================================================ */
-        uint8_t ir_left_val = ir_left_wall();
-        uint8_t ir_right_val = ir_right_wall();
-
         /* ================================================================
          * STOP — all five sensors see open space:
          *   • Both IR sensors open (no wall at front corners)
@@ -722,9 +641,6 @@ int main(void) {
             && side_l_open && side_r_open)
         {
             Motor_Stop();
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                            "STOP", "ALL_OPEN");
-            UART_SendString("STOP: open space\r\n");
             while (1);  /* halt — reset board to restart */
         }
 
@@ -743,9 +659,6 @@ int main(void) {
             state = S_APPROACH;
             approach_start_ms = timer_get_ms();
             ir_last_change_ms = timer_get_ms();
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH",
-                            "FRONT_CLOSE");
-            UART_SendString("Approach\r\n");
         }
 
         /* ================================================================
@@ -779,9 +692,6 @@ int main(void) {
                     state           = S_TURN_LEFT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 0u;
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_LEFT", "IR_RIGHT_OPEN");
-                    UART_SendString("Turn L\r\n");
                     continue;
                 }
 
@@ -790,9 +700,6 @@ int main(void) {
                     state           = S_TURN_RIGHT;
                     turn_start_ms   = timer_get_ms();
                     last_turn_right = 1u;
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_RIGHT", "IR_LEFT_OPEN");
-                    UART_SendString("Turn R\r\n");
                     continue;
                 }
             }
@@ -807,35 +714,21 @@ int main(void) {
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 0u;
                     ir_last_change_ms = timer_get_ms();
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_LEFT", "TIMEOUT_IR_RIGHT");
-                    UART_SendString("TIMEOUT Turn L\r\n");
                     continue;
                 } else if (ir_left_now_check == 0u) {
                     state             = S_TURN_RIGHT;
                     turn_start_ms     = timer_get_ms();
                     last_turn_right   = 1u;
                     ir_last_change_ms = timer_get_ms();
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "TURN_RIGHT", "TIMEOUT_IR_LEFT");
-                    UART_SendString("TIMEOUT Turn R\r\n");
                     continue;
                 } else {
-                    /* FIX 1: Both walls present - BACKUP instead of STOP */
-                    Motor_Forward(50u, 50u); /* reverse at low speed */
-                    log_sensor_data(dl, dr, df, ir_left_val, ir_right_val,
-                                    "BACKUP", "BOTH_WALLS_TIMEOUT");
-                    UART_SendString("TIMEOUT BACKUP\r\n");
-                    state = S_APPROACH; /* stay in APPROACH, reset timer */
+                    Motor_Forward(50u, 50u);
+                    state = S_APPROACH;
                     approach_start_ms = timer_get_ms();
                     continue;
                 }
             }
 
-            /* @brief  both walls still present — keep creeping forward slowly
-             */
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "APPROACH",
-                            "WAIT_IR");
         }
 
         /* ================================================================
@@ -859,14 +752,6 @@ int main(void) {
         }
 
         /* ================================================================
-         * Log wall-following state
-         * ================================================================ */
-        if (state == S_STRAIGHT) {
-            log_sensor_data(dl, dr, df, ir_left_val, ir_right_val, "STRAIGHT",
-                            "PID_FOLLOW");
-        }
-
-        /* ================================================================
          * Drive
          * ================================================================ */
         float total = w_corr + e_corr;
@@ -878,36 +763,6 @@ int main(void) {
         rs = clamp16(rs, (int16_t)MIN_SPEED, (int16_t)MAX_SPEED);
         Motor_Forward((uint8_t)ls, (uint8_t)rs);
 
-        /* ================================================================
-         * Debug output
-         * ================================================================ */
-        UART_SendString("L=");
-        uart_print_i16((int16_t)dl);
-        UART_SendString(" R=");
-        uart_print_i16((int16_t)dr);
-        UART_SendString(" F=");
-        uart_print_i16((int16_t)df);
-        UART_SendString(" e=");
-        uart_print_i16((int16_t)raw_err);
-        UART_SendString(" W=");
-        uart_print_i16((int16_t)w_corr);
-        UART_SendString(" EL=");
-        uart_print_i32(el);
-        UART_SendString(" ER=");
-        uart_print_i32(er);
-        UART_SendString(" E=");
-        uart_print_i16((int16_t)e_corr);
-        UART_SendString(" LS=");
-        uart_print_i16(ls);
-        UART_SendString(" RS=");
-        uart_print_i16(rs);
-        UART_SendString(" IRL=");
-        uart_print_i16((int16_t)ir_left_wall());
-        UART_SendString(" IRR=");
-        uart_print_i16((int16_t)ir_right_wall());
-        UART_SendString(" ST=");
-        uart_print_i16((int16_t)state);
-        UART_SendString("\r\n");
     }
 
     return 0;

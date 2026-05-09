@@ -10,7 +10,7 @@ OBJCOPY = avr-objcopy
 AVRDUDE = avrdude
 
 PROGRAMMER = arduino
-PORT = /dev/ttyUSB0
+PORT = COM6
 BAUD = 57600
 
 CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -Os -std=c11 -Wall
@@ -21,6 +21,7 @@ INCLUDES = -Iapp \
            -Idrivers/uart \
            -Idrivers/timer \
            -Idrivers/pwm \
+           -Idrivers/Ultrasonic \
            -Imodules/motor
 
 SRC = app/main.c \
@@ -29,6 +30,7 @@ SRC = app/main.c \
       drivers/uart/uart.c \
       drivers/timer/timer.c \
       drivers/pwm/pwm.c \
+      drivers/Ultrasonic/Ultrasonic.c \
       modules/motor/motor.c
 
 TARGET_DIR = build
