@@ -10,7 +10,7 @@ OBJCOPY = avr-objcopy
 AVRDUDE = avrdude
 
 PROGRAMMER = arduino
-PORT = /dev/ttyUSB0
+PORT = COM14
 BAUD = 57600
 
 CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -Os -std=c11 -Wall
