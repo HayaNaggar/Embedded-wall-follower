@@ -73,9 +73,9 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u<<IR_RIGHT_BIT)) ?
 #define TURN_OUTER          230u
 #define TURN_INNER          110u
 #define TURN_90_TICKS_L     420u   /* sum of |left| + |right| encoder ticks for left  90° */
-#define TURN_90_TICKS_R     300u   /* sum of |left| + |right| encoder ticks for right 90° */
-#define FRONT_ALIGN_CM       10u   /* creep until front wall ≤ this before pivoting (cm)  */
-#define CREEP_SPEED          70u   /* PWM during S_CREEP_CENTER (above stall threshold)    */
+#define TURN_90_TICKS_R     380u   /* sum of |left| + |right| encoder ticks for right 90° */
+#define FRONT_ALIGN_CM       18u   /* creep until front wall ≤ this before pivoting (cm)  */
+#define CREEP_SPEED          50u   /* PWM during S_CREEP_CENTER (above stall threshold)    */
 #define TURN_TIMEOUT_MS    1500u   /* safety: abort pivot after this (ms)                  */
 #define CREEP_TIMEOUT_MS   3000u   /* safety: abort creep if no front wall found (ms)      */
 #define POST_TURN_MS        200u   /* straight burst after pivot to clear junction (ms)     */
@@ -84,7 +84,7 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u<<IR_RIGHT_BIT)) ?
  * Drive parameters
  * ========================================================================= */
 #define BASE_SPEED   210u   /* normal forward PWM (0–255)              */
-#define SPEED_SLOW   130u   /* maximum speed cap while in S_APPROACH   */
+#define SPEED_SLOW   80u   /* maximum speed cap while in S_APPROACH   */
 #define MAX_SPEED    255u
 #define MIN_SPEED     55u
 #define RIGHT_REDUCE   0    /* trim if one physical motor runs faster   */
@@ -99,22 +99,22 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u<<IR_RIGHT_BIT)) ?
  * In S_APPROACH the ramp output is capped at SPEED_SLOW so the robot
  * always arrives at a junction slowly regardless of front distance.
  * ========================================================================= */
-#define FRONT_SLOW_CM    45u   /* enter S_APPROACH when front ≤ this (cm)  */
-#define FRONT_FULL_CM   100u   /* ramp starts reducing speed below this     */
-#define FRONT_STOP_CM    10u   /* minimum approach distance                 */
-#define SPEED_MIN_FWD    55u   /* minimum drive speed (above motor stall)   */
+#define FRONT_SLOW_CM    50u   /* enter S_APPROACH when front ≤ this (cm)  */
+#define FRONT_FULL_CM   80u   /* ramp starts reducing speed below this     */
+#define FRONT_STOP_CM    12u   /* minimum approach distance                 */
+#define SPEED_MIN_FWD    40u   /* minimum drive speed (above motor stall)   */
 
 /* =========================================================================
  * Wall-centering PID
  *   Gains: start with KI = 0; enable only after KP and KD are stable.
  * ========================================================================= */
-#define WALL_KP            4.5f
+#define WALL_KP            5.5f   /* raised from 4.5 for smoother/ceramic floor */
 #define WALL_KI            0.0f
-#define WALL_KD            1.0f
-#define WALL_MAX_OUT      85.0f
+#define WALL_KD            1.5f   /* raised from 1.0 — more damping to prevent overshoot on low-grip surface */
+#define WALL_MAX_OUT      95.0f   /* raised from 85 — more correction authority */
 #define WALL_INTEGRAL_LIM 30.0f
 #define WALL_DEADBAND      0.3f
-#define WALL_DERIV_ALPHA   0.3f   /* low-pass filter on derivative: 0=raw, 1=frozen */
+#define WALL_DERIV_ALPHA   0.15f  /* reduced from 0.3 — faster derivative response on ceramic */
 
 /* =========================================================================
  * Post-turn single-wall realignment
@@ -695,12 +695,19 @@ int main(void)
                     UART_SendString("R->crp\r\n");
                     continue;
                 }
-                if (il_now == 0u && ir_now == 0u) {          /* both open → default RIGHT */
-                    if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
-                    last_turn_right = 1u;
-                    state           = S_CREEP_CENTER;
-                    turn_start_ms   = timer_get_ms();
-                    UART_SendString("R(both)->crp\r\n");
+                if (il_now == 0u && ir_now == 0u) {          /* both open → use side US to pick */
+                    uint8_t go_right = (dr >= dl);           /* farther US side = more open space */
+                    if (go_right) {
+                        if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
+                        last_turn_right = 1u;
+                        UART_SendString("R(US-both)->crp\r\n");
+                    } else {
+                        if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
+                        last_turn_right = 0u;
+                        UART_SendString("L(US-both)->crp\r\n");
+                    }
+                    state         = S_CREEP_CENTER;
+                    turn_start_ms = timer_get_ms();
                     continue;
                 }
             }
@@ -734,7 +741,22 @@ int main(void)
             if (app_elapsed > 2500u) {
                 uint8_t il_c = ir_left_wall();
                 uint8_t ir_c = ir_right_wall();
-                if (ir_c == 0u) {                /* right open (or both open) → RIGHT */
+                if (il_c == 0u && ir_c == 0u) { /* both open → side US decides */
+                    uint8_t go_right = (dr >= dl);
+                    if (go_right) {
+                        if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
+                        last_turn_right = 1u;
+                        UART_SendString("TO R(US)\r\n");
+                    } else {
+                        if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
+                        last_turn_right = 0u;
+                        UART_SendString("TO L(US)\r\n");
+                    }
+                    state         = S_CREEP_CENTER;
+                    turn_start_ms = timer_get_ms();
+                    ir_stable_us  = 0u;
+                    continue;
+                } else if (ir_c == 0u) {         /* right open only → RIGHT */
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
                     last_turn_right = 1u;
                     state           = S_CREEP_CENTER;

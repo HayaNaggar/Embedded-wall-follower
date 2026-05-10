@@ -15,8 +15,8 @@
 /* Maximum wait for echo pin to go HIGH after trigger */
 #define US_ECHO_WAIT_MS   4u
 
-/* Maximum echo HIGH duration → ~136 cm limit */
-#define US_ECHO_MAX_US 8000u
+/* Maximum echo HIGH duration → matches US_MAX_CM=60 cm (60×58=3480 µs + margin) */
+#define US_ECHO_MAX_US 4000u
 
 /* -------------------------------------------------------------------------
  * US_Init
