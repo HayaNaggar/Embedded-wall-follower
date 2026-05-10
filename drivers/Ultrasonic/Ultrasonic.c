@@ -1,74 +1,73 @@
-#include "Ultrasonic.h"
+/**
+ * @file    Ultrasonic.c
+ * @brief   HC-SR04 ultrasonic sensor driver — ATmega328P
+ *
+ * All three sensors (front, left, right) share PORTC.
+ * Timing uses timer_get_ms() / timer_get_us() — no _delay_ms or _delay_us.
+ * The 10 µs trigger pulse is the only busy-wait; it lasts ~160 CPU cycles.
+ */
+
+#include "ultrasonic.h"
 #include "timer.h"
 #include <avr/io.h>
-#include <util/atomic.h>
+#include <stdint.h>
 
-/*
- * Microsecond timestamp: combines the 1ms project counter with TCNT1.
- * Timer1 prescaler=8, F_CPU=16MHz -> 2 ticks/us, period=2000 ticks=1ms.
- * Resolution ~0.5 us. Handles the CTC-reset boundary: if the compare
- * flag is already set but the ISR hasn't run yet, the ms count is
- * adjusted so the result is always monotonic.
- */
-static uint32_t us_now(void)
+/* Maximum wait for echo pin to go HIGH after trigger */
+#define US_ECHO_WAIT_MS   4u
+
+/* Maximum echo HIGH duration → ~136 cm limit */
+#define US_ECHO_MAX_US 8000u
+
+/* -------------------------------------------------------------------------
+ * US_Init
+ * ------------------------------------------------------------------------- */
+void US_Init(void)
 {
-    uint32_t ms;
-    uint16_t tc;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        tc = TCNT1;
-        ms = timer_get_ms();
-        if ((TIFR1 & (1u << OCF1A)) && tc < 4u) ms++;
-    }
-    return ms * 1000UL + (uint32_t)(tc >> 1u);
+    /* TRIG pins → output, start LOW */
+    DDRC  |=  (1u << US_FRONT_TRIG) | (1u << US_LEFT_TRIG) | (1u << US_RIGHT_TRIG);
+    PORTC &= ~((1u << US_FRONT_TRIG) | (1u << US_LEFT_TRIG) | (1u << US_RIGHT_TRIG));
+
+    /* ECHO pins → input, no pull-up (sensor drives the line) */
+    DDRC  &= ~((1u << US_FRONT_ECHO) | (1u << US_LEFT_ECHO) | (1u << US_RIGHT_ECHO));
 }
 
-void Ultrasonic_Init(uint8_t trig_mask, uint8_t echo_mask)
+/* -------------------------------------------------------------------------
+ * US_ReadCm
+ * ------------------------------------------------------------------------- */
+uint16_t US_ReadCm(uint8_t trig, uint8_t echo)
 {
-    DDRC |=   trig_mask;
-    DDRC &=  ~echo_mask;
-    PORTC &= ~trig_mask;
-}
+    uint32_t t0;
 
-uint16_t Ultrasonic_ReadOnce(uint8_t trig, uint8_t echo)
-{
-    /* Wait for any lingering echo to clear (up to 10 ms) */
-    uint32_t t0 = timer_get_ms();
+    /* 1. Wait for any lingering echo to clear (10 ms max) */
+    t0 = timer_get_ms();
     while ((PINC & (1u << echo)) && (timer_get_ms() - t0) < 10u)
         ;
 
-    /* 10 us trigger pulse measured by us_now() — no _delay_us */
+    /* 2. Send 10 µs trigger pulse, timed with timer_get_us() */
     PORTC |= (1u << trig);
-    uint32_t t_trig = us_now();
-    while ((us_now() - t_trig) < 10u)
+    uint32_t t_pulse = timer_get_us();
+    while ((timer_get_us() - t_pulse) < 10u)
         ;
     PORTC &= ~(1u << trig);
 
-    /* Wait for echo HIGH (4 ms timeout) */
+    /* 3. Wait for ECHO to go HIGH */
     t0 = timer_get_ms();
     while (!(PINC & (1u << echo))) {
-        if ((timer_get_ms() - t0) >= 4u) return 0u;
+        if ((timer_get_ms() - t0) >= US_ECHO_WAIT_MS)
+            return 0u;
     }
 
-    /* Measure echo HIGH duration */
-    uint32_t echo_start = us_now();
+    /* 4. Measure ECHO HIGH duration in microseconds */
+    uint32_t echo_start = timer_get_us();
     while (PINC & (1u << echo)) {
-        if ((us_now() - echo_start) >= 8000u) return 0u;
+        if ((timer_get_us() - echo_start) >= US_ECHO_MAX_US)
+            return 0u;
     }
-    uint32_t duration_us = us_now() - echo_start;
 
-    if (duration_us == 0u) return 0u;
+    uint32_t duration_us = timer_get_us() - echo_start;
+    if (duration_us == 0u)
+        return 0u;
+
+    /* 5. Distance (cm) = duration_µs / 58 */
     return (uint16_t)(duration_us / 58u);
-}
-
-uint16_t Ultrasonic_ReadMedian3(uint8_t trig, uint8_t echo)
-{
-    uint16_t s[3], tmp;
-    s[0] = Ultrasonic_ReadOnce(trig, echo);
-    s[1] = Ultrasonic_ReadOnce(trig, echo);
-    s[2] = Ultrasonic_ReadOnce(trig, echo);
-
-    if (s[0] > s[1]) { tmp = s[0]; s[0] = s[1]; s[1] = tmp; }
-    if (s[1] > s[2]) { tmp = s[1]; s[1] = s[2]; s[2] = tmp; }
-    if (s[0] > s[1]) { tmp = s[0]; s[0] = s[1]; s[1] = tmp; }
-    return s[1];
 }
