@@ -100,6 +100,27 @@ void timer_delay_ms(uint32_t ms) {
 }
 
 /**
+ * @brief  Return elapsed microseconds since timer_init().
+ *
+ * Reads TCNT1 and g_ms_ticks atomically.  Handles the CTC-reset boundary:
+ * if the compare flag (OCF1A) is already set but the ISR has not yet run,
+ * g_ms_ticks is incremented here so the result is always monotonic.
+ *
+ * Timer1 prescaler = 8, F_CPU = 16 MHz → each tick = 0.5 µs.
+ * tc >> 1 converts Timer1 ticks to microseconds.
+ */
+uint32_t timer_get_us(void) {
+    uint32_t ms;
+    uint16_t tc;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        tc = TCNT1;
+        ms = g_ms_ticks;
+        if ((TIFR1 & (1u << OCF1A)) && tc < 4u) ms++;
+    }
+    return ms * 1000UL + (uint32_t)(tc >> 1u);
+}
+
+/**
  * @brief  Blocking microsecond delay using Timer1.
  * @param  us  Microseconds to wait.
  *

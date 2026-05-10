@@ -49,4 +49,15 @@ void timer_delay_ms(uint32_t ms);
  */
 void timer_delay_us(uint16_t us);
 
+/**
+ * @brief  Return elapsed microseconds since timer_init() was called.
+ *
+ * Combines the 1ms tick counter with TCNT1 (Timer1, prescaler=8, 16MHz)
+ * to give ~0.5 µs resolution.  Safe to call from main loop and from
+ * within atomic sections (does its own atomic snapshot internally).
+ *
+ * @return 32-bit microsecond count.
+ */
+uint32_t timer_get_us(void);
+
 #endif /* TIMER_H */

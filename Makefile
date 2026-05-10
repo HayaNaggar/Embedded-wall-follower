@@ -16,19 +16,17 @@ BAUD = 57600
 CFLAGS = -mmcu=$(MCU) -DF_CPU=$(F_CPU) -Os -std=c11 -Wall
 
 INCLUDES = -Iapp \
-           -Idrivers/gpio \
-           -Idrivers/sensors/IR \
            -Idrivers/uart \
            -Idrivers/timer \
            -Idrivers/pwm \
+           -Idrivers/Ultrasonic \
            -Imodules/motor
 
 SRC = app/main.c \
-      drivers/gpio/gpio.c \
-      drivers/sensors/IR/IR_sensor.c \
       drivers/uart/uart.c \
       drivers/timer/timer.c \
       drivers/pwm/pwm.c \
+      drivers/Ultrasonic/Ultrasonic.c \
       modules/motor/motor.c
 
 TARGET_DIR = build
