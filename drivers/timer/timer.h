@@ -2,16 +2,12 @@
  * @file    timer.h
  * @brief   Timer driver interface for ATmega328P
  *
- * Provides:
- *  - Non-blocking millisecond tick counter via Timer0 CTC + ISR
- *  - Blocking delay functions (ms and us) via Timer1
- *
  * Timer allocation:
- *  - Timer0 (8-bit)  : CTC mode, 1ms tick ISR  -> millis counter
- *  - Timer1 (16-bit) : Input Capture / one-shot -> delay_us, delay_ms
+ *  - Timer0 (8-bit)  : Fast PWM for motor control (OC0A / OC0B)
+ *  - Timer1 (16-bit) : 1 ms CTC tick ISR + timer_get_us() via TCNT1
+ *  - Timer2          : unused
  *
- * @note    Call timer_init() once before using any other function.
- *          sei() (global interrupt enable) must be called after timer_init().
+ * Call timer_init() once at startup before sei().
  */
 
 #ifndef TIMER_H
@@ -19,44 +15,26 @@
 
 #include <stdint.h>
 
-/* -----------------------------------------------------------------------
- * Public API
- * ----------------------------------------------------------------------- */
-
-/**
- * @brief  Initialize Timer0 for 1ms CTC tick and Timer1 for blocking delays.
- *         Must be called once at startup before sei().
- */
+/** @brief Initialize Timer1 for 1 ms CTC tick. Must be called before sei(). */
 void timer_init(void);
 
-/**
- * @brief  Return elapsed milliseconds since timer_init() was called.
- * @return 32-bit millisecond count (rolls over after ~49 days).
- * @note   Safe to call from main loop; value is updated by Timer0 ISR.
- */
+/** @brief Return elapsed milliseconds since timer_init() (rolls over after ~49 days). */
 uint32_t timer_get_ms(void);
 
-/**
- * @brief  Blocking delay in milliseconds using the tick counter.
- * @param  ms  Number of milliseconds to wait.
- */
+/** @brief Blocking delay in milliseconds. */
 void timer_delay_ms(uint32_t ms);
 
 /**
  * @brief  Blocking delay in microseconds using Timer1 busy-wait.
- * @param  us  Number of microseconds to wait (minimum reliable value: 2 us).
- * @note   Uses a tight Timer1 loop; interrupts are NOT disabled during this call.
+ * @note   Minimum reliable value: 2 µs. Interrupts are not disabled.
  */
 void timer_delay_us(uint16_t us);
 
 /**
- * @brief  Return elapsed microseconds since timer_init() was called.
+ * @brief  Return elapsed microseconds since timer_init().
  *
- * Combines the 1ms tick counter with TCNT1 (Timer1, prescaler=8, 16MHz)
- * to give ~0.5 µs resolution.  Safe to call from main loop and from
- * within atomic sections (does its own atomic snapshot internally).
- *
- * @return 32-bit microsecond count.
+ * Combines the 1 ms tick counter with TCNT1 for ~0.5 µs resolution.
+ * Safe to call from main loop and from atomic sections.
  */
 uint32_t timer_get_us(void);
 
