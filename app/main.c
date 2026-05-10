@@ -72,10 +72,10 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u<<IR_RIGHT_BIT)) ?
  * ========================================================================= */
 #define TURN_OUTER          230u
 #define TURN_INNER          110u
-#define TURN_90_TICKS_L     400u   /* sum of |left| + |right| encoder ticks for left  90° */
-#define TURN_90_TICKS_R     280u   /* sum of |left| + |right| encoder ticks for right 90° */
+#define TURN_90_TICKS_L     420u   /* sum of |left| + |right| encoder ticks for left  90° */
+#define TURN_90_TICKS_R     300u   /* sum of |left| + |right| encoder ticks for right 90° */
 #define FRONT_ALIGN_CM       10u   /* creep until front wall ≤ this before pivoting (cm)  */
-#define CREEP_SPEED          60u   /* PWM during S_CREEP_CENTER (above stall threshold)    */
+#define CREEP_SPEED          70u   /* PWM during S_CREEP_CENTER (above stall threshold)    */
 #define TURN_TIMEOUT_MS    1500u   /* safety: abort pivot after this (ms)                  */
 #define CREEP_TIMEOUT_MS   3000u   /* safety: abort creep if no front wall found (ms)      */
 #define POST_TURN_MS        200u   /* straight burst after pivot to clear junction (ms)     */
@@ -99,9 +99,9 @@ static inline uint8_t ir_right_wall(void) { return (PIND & (1u<<IR_RIGHT_BIT)) ?
  * In S_APPROACH the ramp output is capped at SPEED_SLOW so the robot
  * always arrives at a junction slowly regardless of front distance.
  * ========================================================================= */
-#define FRONT_SLOW_CM    35u   /* enter S_APPROACH when front ≤ this (cm)  */
+#define FRONT_SLOW_CM    45u   /* enter S_APPROACH when front ≤ this (cm)  */
 #define FRONT_FULL_CM   100u   /* ramp starts reducing speed below this     */
-#define FRONT_STOP_CM    15u   /* minimum approach distance                 */
+#define FRONT_STOP_CM    10u   /* minimum approach distance                 */
 #define SPEED_MIN_FWD    55u   /* minimum drive speed (above motor stall)   */
 
 /* =========================================================================
@@ -243,13 +243,22 @@ static void print_i16(int16_t v)
     print_u16((uint16_t)v);
 }
 
-static void send_turn_report(uint8_t count, const char *seq)
+static void send_turn_report(uint8_t count, const char *seq, uint32_t elapsed_ms)
 {
-    UART_SendString("Turns: ");
+    uint32_t secs = elapsed_ms / 1000UL;
+    uint16_t ms   = (uint16_t)(elapsed_ms % 1000UL);
+
+    UART_SendString("Time: ");
+    print_u16((uint16_t)secs);
+    UART_SendChar('.');
+    if (ms < 100u) UART_SendChar('0');
+    if (ms <  10u) UART_SendChar('0');
+    print_u16(ms);
+    UART_SendString("s\r\nTurns: ");
     print_u16(count);
-    UART_SendString("\r\nSequence: ");
+    UART_SendString("\r\nSeq: ");
     for (uint8_t i = 0u; i < count; i++) {
-        if (i) UART_SendString(", ");
+        if (i) UART_SendChar(',');
         UART_SendChar(seq[i]);
     }
     UART_SendString("\r\n");
@@ -346,6 +355,7 @@ int main(void)
         if (wr >= US_MIN_CM && wr <= US_MAX_CM) last_good_r = wr;
     }
     UART_SendString("Go.\r\n");
+    uint32_t maze_start_ms = timer_get_ms();
     enc_reset();
 
     /* ── FSM definition ──────────────────────────────────────────────────── */
@@ -593,33 +603,37 @@ int main(void)
             continue;
         }
 
+        /* IR readings — sampled once per loop for stop check, debug, and S_APPROACH */
+        uint8_t il_now = ir_left_wall();
+        uint8_t ir_now = ir_right_wall();
+
         /* ================================================================
-         * STOP — maze exit: all 4 sensors report nothing simultaneously.
+         * STOP — maze exit detection.
          *
-         * Condition (all must be true at the same time):
-         *   1. Left  US silent for >= WALL_ABSENT_MS (timestamp)
-         *   2. Right US silent for >= WALL_ABSENT_MS (timestamp)
-         *   3. Left  IR sees no wall
-         *   4. Right IR sees no wall
+         * Primary: BOTH IR sensors see no wall — the most reliable signal
+         * that the robot has left the maze (in any corridor at least one
+         * IR always sees a wall).
          *
-         * Front US is intentionally excluded: last_valid_front only updates
-         * on a real echo, so it stays frozen at the last in-maze reading
-         * when the robot exits (front US returns 0 = no echo = open space),
-         * making that check always false at the exit.
+         * Secondary guard: at least ONE side US has been silent for
+         * >= WALL_ABSENT_MS — prevents stopping in a momentary wide section
+         * where both IRs briefly see nothing.  Only one side required because
+         * exit walls often extend along one side beyond the maze boundary.
          *
-         * At in-maze junctions at most one side US opens and one IR fires,
-         * so this 4-way AND cannot false-trigger mid-maze.
-         * Only checked in S_STRAIGHT; timestamps are reset after every turn.
+         * Checked in S_STRAIGHT and S_APPROACH (the stop zone can be reached
+         * while the front US has already triggered approach mode).
+         * Timestamps are reset after every turn so the US guard cannot be
+         * pre-satisfied from a previous corridor.
          * ================================================================ */
         {
             uint8_t no_l_us  = (timer_get_ms() - l_wall_ms) >= WALL_ABSENT_MS;
             uint8_t no_r_us  = (timer_get_ms() - r_wall_ms) >= WALL_ABSENT_MS;
             uint8_t no_l_ir  = (ir_left_wall()  == 0u);
             uint8_t no_r_ir  = (ir_right_wall() == 0u);
-            if (state == S_STRAIGHT
-                && no_l_us && no_r_us && no_l_ir && no_r_ir) {
+            if ((state == S_STRAIGHT || state == S_APPROACH)
+                && (no_l_us || no_r_us) && no_l_ir && no_r_ir) {
                 Motor_Stop();
-                send_turn_report(turn_count, turn_seq);
+                send_turn_report(turn_count, turn_seq,
+                                 timer_get_ms() - maze_start_ms);
                 while (1);
             }
         }
@@ -654,9 +668,6 @@ int main(void)
             uint32_t app_elapsed = timer_get_ms() - approach_start_ms;
             uint32_t now_us      = timer_get_us();
 
-            uint8_t il_now = ir_left_wall();
-            uint8_t ir_now = ir_right_wall();
-
             /* Update debounce timestamp whenever IR state changes */
             if ((il_now != ir_last_left) || (ir_now != ir_last_right)) {
                 ir_last_left  = il_now;
@@ -668,7 +679,7 @@ int main(void)
 
             /* --- Primary: IR stable for ≥ 80 ms ---------------------------------------- */
             if (ir_stable_us != 0u && (now_us - ir_stable_us) >= 80000UL) {
-                if (il_now == 0u && ir_now != 0u) {          /* left  open → LEFT  turn */
+                if (il_now == 0u && ir_now != 0u) {          /* left  open only → LEFT  turn */
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
                     last_turn_right = 0u;
                     state           = S_CREEP_CENTER;
@@ -676,7 +687,7 @@ int main(void)
                     UART_SendString("L->crp\r\n");
                     continue;
                 }
-                if (ir_now == 0u && il_now != 0u) {          /* right open → RIGHT turn */
+                if (ir_now == 0u && il_now != 0u) {          /* right open only → RIGHT turn */
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
                     last_turn_right = 1u;
                     state           = S_CREEP_CENTER;
@@ -684,14 +695,24 @@ int main(void)
                     UART_SendString("R->crp\r\n");
                     continue;
                 }
+                if (il_now == 0u && ir_now == 0u) {          /* both open → default RIGHT */
+                    if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
+                    last_turn_right = 1u;
+                    state           = S_CREEP_CENTER;
+                    turn_start_ms   = timer_get_ms();
+                    UART_SendString("R(both)->crp\r\n");
+                    continue;
+                }
             }
 
             /* --- Fallback: raw side US when front is very close -------------------------*/
-            /* US sensors are physically on the correct sides (left US = left wall).    */
+            /* IR must agree with the US reading to avoid false turns caused by a
+             * stale last_good_l/r (reset to 20 cm in S_POST_TURN, which can read
+             * > 25 cm after a wide turn and trigger a phantom open-side decision). */
             if (df <= 18u) {
                 uint8_t l_open = (dl_raw == 0u || dl_raw > 25u);
                 uint8_t r_open = (dr_raw == 0u || dr_raw > 25u);
-                if (l_open && !r_open) {
+                if (l_open && !r_open && il_now == 0u) {
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
                     last_turn_right = 0u;
                     state           = S_CREEP_CENTER;
@@ -699,7 +720,7 @@ int main(void)
                     UART_SendString("L(US)->crp\r\n");
                     continue;
                 }
-                if (r_open && !l_open) {
+                if (r_open && !l_open && ir_now == 0u) {
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
                     last_turn_right = 1u;
                     state           = S_CREEP_CENTER;
@@ -713,21 +734,21 @@ int main(void)
             if (app_elapsed > 2500u) {
                 uint8_t il_c = ir_left_wall();
                 uint8_t ir_c = ir_right_wall();
-                if (il_c == 0u) {
-                    if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
-                    last_turn_right = 0u;
-                    state           = S_CREEP_CENTER;
-                    turn_start_ms   = timer_get_ms();
-                    ir_stable_us    = 0u;
-                    UART_SendString("TO L\r\n");
-                    continue;
-                } else if (ir_c == 0u) {
+                if (ir_c == 0u) {                /* right open (or both open) → RIGHT */
                     if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'R';
                     last_turn_right = 1u;
                     state           = S_CREEP_CENTER;
                     turn_start_ms   = timer_get_ms();
                     ir_stable_us    = 0u;
                     UART_SendString("TO R\r\n");
+                    continue;
+                } else if (il_c == 0u) {         /* left open only → LEFT */
+                    if (turn_count < MAX_TURNS) turn_seq[turn_count++] = 'L';
+                    last_turn_right = 0u;
+                    state           = S_CREEP_CENTER;
+                    turn_start_ms   = timer_get_ms();
+                    ir_stable_us    = 0u;
+                    UART_SendString("TO L\r\n");
                     continue;
                 } else {
                     Motor_Forward(50u, 50u);
@@ -789,16 +810,19 @@ int main(void)
          * DEBUG — throttled to every 10th loop (~100 ms at 10 ms/loop)
          * Fields: L R F — US distances (cm)
          *         e     — raw wall error (cm)
+         *         IL IR  — IR left / right (1=wall, 0=open)
          *         S     — FSM state index
          *         T     — turn count so far
          * ================================================================ */
         if ((++print_cnt % 10u) == 0u) {
-            UART_SendString("L=");  print_i16((int16_t)dl);
-            UART_SendString(" R="); print_i16((int16_t)dr);
-            UART_SendString(" F="); print_i16((int16_t)df);
-            UART_SendString(" e="); print_i16((int16_t)raw_err);
-            UART_SendString(" S="); print_i16((int16_t)state);
-            UART_SendString(" T="); print_u16(turn_count);
+            UART_SendString("L=");   print_i16((int16_t)dl);
+            UART_SendString(" R=");  print_i16((int16_t)dr);
+            UART_SendString(" F=");  print_i16((int16_t)df);
+            UART_SendString(" e=");  print_i16((int16_t)raw_err);
+            UART_SendString(" IL="); UART_SendChar(il_now ? '1' : '0');
+            UART_SendString(" IR="); UART_SendChar(ir_now ? '1' : '0');
+            UART_SendString(" S=");  print_i16((int16_t)state);
+            UART_SendString(" T=");  print_u16(turn_count);
             UART_SendString("\r\n");
         }
     }
